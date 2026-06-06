@@ -24,8 +24,11 @@ public class RespSerializer {
     /** Serialize a generic Java object as RESP. */
     public static void serialize(Object obj, OutputStream out) throws IOException {
         if (obj == null) {
-            // By default we treat null as a Null Bulk String. Callers can choose array null explicitly.
             writeNullBulkString(out);
+            return;
+        }
+        if (obj instanceof ErrorResponse e) {
+            writeError(e.message(), out);
             return;
         }
         if (obj instanceof String) {

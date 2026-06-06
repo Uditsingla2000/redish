@@ -1,10 +1,6 @@
 # Redish — A Redis Clone in Java
 
-A step-by-step reimplementation of Redis internals in Java 24, following along with Arpit Bhayani's Redis internals playlist.
-
-## Project Structure
-
-This is a Maven project structured around building both the Redis server and a custom Redis client (CLI).
+A step-by-step reimplementation of Redis internals in Java 24, following along with Arpit Bhayani's Redis internals playlist. Focus on low-level design patterns.
 
 ## Prerequisites
 
@@ -13,29 +9,65 @@ This is a Maven project structured around building both the Redis server and a c
 
 ## Setup and Running
 
-1. **Clone the repository and navigate to the project directory:**
-   ```bash
-   cd redish
-   ```
+```bash
+git clone <repo>
+cd redish
 
-2. **Compile the project:**
-   ```bash
-   mvn clean compile
-   ```
+# Build
+mvn compile
 
-3. **Run the Server:**
-   In one terminal tab, start the Redish server:
-   ```bash
-   mvn exec:java -Dexec.mainClass=dev.redish.Server
-   ```
-   *By default, the server binds to port 6380 (to avoid conflicting with a real Redis instance on 6379).*
+# Start server (port 6380)
+mvn exec:java -Dexec.mainClass=dev.redish.Server
+# or: ./rserver
 
-4. **Run the Client (Interactive CLI):**
-   In a separate terminal tab, connect to the server using our built-in client:
-   ```bash
-   mvn exec:java -Dexec.mainClass=dev.redish.Client
-   ```
+# Start interactive client (separate terminal)
+mvn exec:java -Dexec.mainClass=dev.redish.Client
+# or: ./rcli
 
-## Current Features
-- **Phase 1:** Basic TCP Client-Server model (Single-threaded blocking I/O)
-- **Phase 2 (In Progress):** Custom RESP (Redis Serialization Protocol) Parser & Serializer.
+# Run tests
+mvn test
+```
+
+
+## Shell Scripts
+
+- `rserver` — shortcut to run the server
+- `rcli` — shortcut to run the client
+
+
+## Implemented Commands
+
+| Command | Behavior |
+|---|---|
+| `PING` | Returns `PONG` |
+| `PING <arg>` | Returns the argument as a bulk string |
+| `<anything else>` | Returns error: `ERR unknown command '...'` |
+
+## Project Structure
+
+```
+src/
+├── main/java/dev/redish/
+│   ├── Server.java              # TCP server, RESP dispatch loop
+│   ├── Client.java              # Interactive CLI, RESP over PushbackInputStream
+│   ├── command/
+│   │   ├── Command.java         # Command interface
+│   │   ├── CommandRegistry.java # Maps names → handlers
+│   │   ├── PingCommand.java     # PING handler
+│   │   └── UnknownCommand.java  # Fallback handler
+│   └── resp/
+│       ├── RespType.java        # RESP type identifiers
+│       ├── RespParser.java      # InputStream → Java objects
+│       ├── RespSerializer.java  # Java objects → RESP wire format
+│       └── ErrorResponse.java   # Error record (auto-serialized)
+└── test/java/dev/redish/
+    ├── RespParserTest.java      # RESP parsing tests
+    ├── RespSerializerTest.java  # RESP serialization tests
+    ├── PingCommandTest.java     # PING command tests
+    └── CommandRegistryTest.java # Registry tests
+```
+
+## Status
+
+Working: RESP protocol, Command pattern, PING, error handling, tests.
+Next: Add SET/GET with in-memory store, concurrent clients.

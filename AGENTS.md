@@ -7,38 +7,55 @@ Redis clone built for learning low-level design patterns in Java. Simplicity and
 ## Quick start
 
 ```bash
-mvn compile                                # build
-mvn exec:java -Dexec.mainClass=dev.redish.Server   # start server (port 6380)
-mvn exec:java -Dexec.mainClass=dev.redish.Client   # start interactive client
+./rserver        # start server on port 6380
+./rcli           # start interactive client
+
+# Or without scripts:
+mvn compile
+mvn exec:java -Dexec.mainClass=dev.redish.Server
+mvn exec:java -Dexec.mainClass=dev.redish.Client
+
+mvn test         # run all tests
 ```
 
 No Maven wrapper — requires `mvn` on `$PATH`. Java 24.
-
-## Architecture
-
-| Package | What |
-|---|---|
-| `dev.redish` | Entrypoints — `Server` (TCP listener) and `Client` (interactive test tool) |
-| `dev.redish.resp` | RESP protocol — `RespType`, `RespParser`, `RespSerializer` |
-
-**Current state (Phase 1):** Server echoes raw text lines — does NOT speak RESP yet. The `resp` package is usable but not wired into Server/Client. Wired RESP support is the next step.
 
 ## Port
 
 `6380` — deliberately avoids conflicting with a real Redis on 6379.
 
-## Testing
+## Architecture
 
-No test framework configured yet (no JUnit dep, no `src/test`). Add one when tests are written.
+| Package | What |
+|---|---|
+| `dev.redish` | Entrypoints — `Server` (TCP listener), `Client` (interactive CLI) |
+| `dev.redish.command` | Command pattern — `Command` interface, `PingCommand`, `CommandRegistry`, `UnknownCommand` |
+| `dev.redish.resp` | RESP protocol — `RespType`, `RespParser`, `RespSerializer`, `ErrorResponse` |
 
-## Patterns & design
+## Design patterns used
 
-This is a learning project. When adding features, prefer explicit, readable patterns over framework magic. Every phase should demonstrate one or two concrete design patterns (e.g., Command, Strategy, Observer, Reactor, etc.).
+- **Command Pattern** — `Command` interface, each command is a class. Registry maps name → handler.
+- **ErrorResponse record** — errors returned as `ErrorResponse` record, auto-serialized by `RespSerializer` as `-ERR...\r\n`. No public writeError needed.
 
 ## RESP protocol layer
 
-- Parser reads from `InputStream` → returns `String`, `Long`, `List<Object>`, or `null`
-- Serializer writes Java objects → RESP wire format
+- `RespParser.parse(InputStream)` → returns `String`, `Long`, `List<Object>`, or `null`
+- `RespSerializer.serialize(Object, OutputStream)` — writes RESP wire format
+- `RespSerializer.serialize(new ErrorResponse("ERR ..."), out)` — writes `-ERR ...\r\n`
 - Simple strings auto-upgrade to bulk strings when content contains CR/LF
 - Null bulk string (`$-1\r\n`) and null array (`*-1\r\n`) supported
 - Not binary-safe (bulk strings decoded as UTF-8)
+
+## Testing
+
+JUnit 5 + Surefire. Tests at `src/test/java/`.
+Run all: `mvn test`
+Current count: 22 tests (RespParser, RespSerializer, PingCommand, CommandRegistry)
+
+## Current state
+
+- Server reads RESP from client, dispatches via CommandRegistry, writes RESP response
+- Client sends tokenized commands as RESP arrays, displays responses
+- PING → `+PONG`, PING \<arg\> → `$<len>\r\n<arg>\r\n`, PING with >1 arg → error
+- Unknown commands → `-ERR unknown command '...'`
+- Server handles one client at a time (sequential, blocking I/O)
