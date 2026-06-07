@@ -2,12 +2,10 @@ package dev.redish;
 
 import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.PushbackInputStream;
 import java.net.Socket;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import dev.redish.resp.RespParser;
@@ -18,7 +16,7 @@ public class Client {
     private static final String HOST = "127.0.0.1";
     private static final int    PORT = 6380;
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) {
 
         Logo.print();
         System.out.println("─".repeat(48));
@@ -26,10 +24,22 @@ public class Client {
         System.out.println("─".repeat(48));
         System.out.flush();
 
+        Socket socket;
+        try {
+            socket = new Socket(HOST, PORT);
+        } catch (java.net.ConnectException e) {
+            System.err.println("\n  ✗ Could not connect to Redish server at " + HOST + ":" + PORT);
+            System.err.println("  Make sure ./rserver is running in another terminal.\n");
+            return;
+        } catch (IOException e) {
+            System.err.println("\n  ✗ Connection error: " + e.getMessage() + "\n");
+            return;
+        }
+
         try (
-            Socket              socket   = new Socket(HOST, PORT);
-            PushbackInputStream in       = new PushbackInputStream(socket.getInputStream());
-            OutputStream        out      = socket.getOutputStream();
+            Socket              sock     = socket;
+            PushbackInputStream in       = new PushbackInputStream(sock.getInputStream());
+            OutputStream        out      = sock.getOutputStream();
             BufferedReader      keyboard = new BufferedReader(
                     new InputStreamReader(System.in));
         ) {
@@ -81,6 +91,8 @@ public class Client {
                 System.out.print("> ");
                 System.out.flush();
             }
+        } catch (IOException e) {
+            System.err.println("\n  ✗ Connection lost: " + e.getMessage() + "\n");
         }
 
         System.out.println("Goodbye!");
