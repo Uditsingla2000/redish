@@ -29,12 +29,11 @@ public class Server {
 
         try (ServerSocket serverSocket = new ServerSocket(PORT, 50)) {
 
-            System.out.println("╔══════════════════════════════════════╗");
-            System.out.println("║   Redish Server — Phase 2            ║");
-            System.out.println("╠══════════════════════════════════════╣");
-            System.out.printf ("║   Listening on port %-17d║%n", PORT);
-            System.out.println("║   Waiting for a client...            ║");
-            System.out.println("╚══════════════════════════════════════╝");
+            Logo.print();
+            System.out.println("─".repeat(48));
+            System.out.printf("  Server listening on port %d%n", PORT);
+            System.out.println("  Waiting for a client...");
+            System.out.println("─".repeat(48));
 
             while (true) {
                 Socket clientSocket = serverSocket.accept();

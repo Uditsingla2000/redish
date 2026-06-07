@@ -20,11 +20,10 @@ public class Client {
 
     public static void main(String[] args) throws IOException {
 
-        System.out.println("╔══════════════════════════════════════╗");
-        System.out.println("║   Redish Client — Phase 2            ║");
-        System.out.println("╠══════════════════════════════════════╣");
-        System.out.printf ("║   Connecting to %s:%-8d   ║%n", HOST, PORT);
-        System.out.println("╚══════════════════════════════════════╝");
+        Logo.print();
+        System.out.println("─".repeat(48));
+        System.out.printf("  Connecting to %s:%d%n", HOST, PORT);
+        System.out.println("─".repeat(48));
         System.out.flush();
 
         try (
