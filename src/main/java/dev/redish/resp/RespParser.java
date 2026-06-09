@@ -2,6 +2,7 @@ package dev.redish.resp;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
@@ -99,6 +100,91 @@ public class RespParser {
         List<Object> list = new ArrayList<>(count);
         for (int i = 0; i < count; i++) {
             list.add(parse(in));
+        }
+        return list;
+    }
+
+    // ─── ByteBuffer-based parseLine (peek with buf.get(i), no advance) ───
+
+    private static String parseLine(ByteBuffer buf) {
+        int start = buf.position();
+        for (int i = start; i < buf.limit(); i++) {
+            if (buf.get(i) == '\r' && i + 1 < buf.limit() && buf.get(i + 1) == '\n') {
+                byte[] line = new byte[i - start];
+                buf.get(line);
+                buf.get(); // \r
+                buf.get(); // \n
+                return new String(line, StandardCharsets.UTF_8);
+            }
+        }
+        buf.position(start);
+        return null;
+    }
+
+    // ─── ByteBuffer-based parse entrypoint ───
+
+    /** RESP type → parser method, null if incomplete. */
+    public static Object parse(ByteBuffer buf) {
+        if (buf.remaining() == 0) return null;
+        RespType type = RespType.fromByte(buf.get(buf.position()));
+        return switch (type) {
+            case SIMPLE_STRING -> parseSimpleString(buf);
+            case ERROR        -> parseError(buf);
+            case INTEGER      -> parseInteger(buf);
+            case BULK_STRING  -> parseBulkString(buf);
+            case ARRAY        -> parseArray(buf);
+        };
+    }
+
+    /** "+" → consume marker, read CRLF line. */
+    private static String parseSimpleString(ByteBuffer buf) {
+        buf.get(); // consume '+'
+        return parseLine(buf);
+    }
+
+    /** "-" → consume marker, read CRLF line. */
+    private static String parseError(ByteBuffer buf) {
+        buf.get(); // consume '-'
+        return parseLine(buf);
+    }
+
+    /** ":" → consume marker, parse CRLF line as long. */
+    private static Long parseInteger(ByteBuffer buf) {
+        buf.get(); // consume ':'
+        String line = parseLine(buf);
+        if (line == null) return null;
+        return Long.parseLong(line);
+    }
+
+    /** "$" → length, then N bytes + CRLF. null on $-1. */
+    private static String parseBulkString(ByteBuffer buf) {
+        int start = buf.position();
+        buf.get(); // consume '$'
+        String lenStr = parseLine(buf);
+        if (lenStr == null) { buf.position(start); return null; }
+        int len = Integer.parseInt(lenStr);
+        if (len == -1) return null;
+        if (buf.remaining() < len + 2) { buf.position(start); return null; }
+        byte[] data = new byte[len];
+        buf.get(data);
+        buf.get(); // \r
+        buf.get(); // \n
+        return new String(data, StandardCharsets.UTF_8);
+    }
+
+    /** "*" → count, then N nested values. null on *-1. */
+    private static List<Object> parseArray(ByteBuffer buf) {
+        int start = buf.position();
+        buf.get(); // consume '*'
+        String lenStr = parseLine(buf);
+        if (lenStr == null) { buf.position(start); return null; }
+        int len = Integer.parseInt(lenStr);
+        if (len == -1) return null;
+        List<Object> list = new ArrayList<>(len);
+        for (int i = 0; i < len; i++) {
+            Object element = parse(buf);
+            if (element == null) { buf.position(start); return null; }
+            list.add(element);
         }
         return list;
     }

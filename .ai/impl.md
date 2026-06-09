@@ -8,15 +8,15 @@ Current `Server.java` accepts one client, handles it, then loops back to `accept
 
 One thread monitors many file descriptors (sockets) and only works on the ones that are "ready" — readable (data arrived), writable (buffer has room), or acceptable (new connection).
 
-On your machine (macOS) this is **kqueue**. On Linux it's **epoll**. Java's `java.nio.channels.Selector` wraps whichever the OS provides — same API.
+On your machine (macOS) this is **kqueue**. On Linux it's **epoll**. Java's `java.nio.channels.Selector` wraps whichever the OS provides.
 
 ```
-// Without multiplexing (current):
+Without multiplexing:
 accept() → blocks until one client connects
 read()   → blocks until that client sends data
 write()  → blocks until buffer drains
 
-// With multiplexing:
+With multiplexing:
 Selector.select() → blocks until *any* channel is ready
     → returns set of ready channels
     → process each: accept(), read(), or write()
@@ -30,172 +30,459 @@ Selector.select() → blocks until *any* channel is ready
 | `SocketChannel` | A connected client socket (one per client) |
 | `Selector` | The multiplexer — monitors all channels |
 | `SelectionKey` | Represents a registered channel + interest ops + attachment |
-| `ByteBuffer` | Buffer for reading/writing bytes (off-heap or heap) |
+| `ByteBuffer` | Buffer for reading/writing bytes |
 
-## The event loop (pseudocode)
+## The event loop
 
 ```java
 Selector selector = Selector.open();
 ServerSocketChannel ssc = ServerSocketChannel.open();
-ssc.bind(new InetSocketAddress(port));
+ssc.bind(new InetSocketAddress(PORT));
 ssc.configureBlocking(false);
 ssc.register(selector, SelectionKey.OP_ACCEPT);
 
 while (true) {
-    selector.select();               // blocks until at least one channel is ready
-    Set<SelectionKey> keys = selector.selectedKeys();
-    Iterator<SelectionKey> it = keys.iterator();
+    selector.select();
+    var it = selector.selectedKeys().iterator();
     while (it.hasNext()) {
         SelectionKey key = it.next();
-        it.remove();                 // must remove after processing
-
-        if (key.isAcceptable())  handleAccept(key);   // new connection
-        if (key.isReadable())    handleRead(key);     // data arrived
-        if (key.isWritable())    handleWrite(key);    // buffer has room
+        it.remove();
+        if (key.isAcceptable())  handleAccept(key);
+        if (key.isReadable())    handleRead(key);
+        if (key.isWritable())    handleWrite(key);
     }
 }
 ```
 
-## Channel states
-
-Each connected `SocketChannel` moves through states:
+## Per-connection state machine
 
 ```
-[ACCEPT] → attach read buffer, register for OP_READ
-             ↓
-[READ]   → read into ByteBuffer
-             ↓  (need more data)
-          keep reading (maybe partial RESP)
-             ↓  (full RESP frame received)
-          parse → execute command → serialize → write into write buffer
-             ↓
-[WRITE]  → register for OP_WRITE, write pending data
-             ↓  (write buffer drained)
-          register for OP_READ (back to reading next command)
-             ↓
-[CLOSE]  → channel closed by client or error → cancel key, close channel
+ACCEPT → attach ConnectionState, register for OP_READ
+           ↓
+READ   → read bytes into readBuf, flip, parse().
+           ↓ (partial frame → null)   ↓ (full frame → command)
+        position(start), compact        execute → serialize → register OP_WRITE
+           ↓                              ↓
+        (wait for more data)           WRITE → drain writeBuf to channel
+                                           ↓ (drained)  ↓ (not drained)
+                                        register OP_READ  stay OP_WRITE
+
+(on -1 read or error): cancel key, close channel
 ```
 
-## State per connection
+---
 
-Each `SelectionKey` needs an attachment to hold per-connection state:
+## Step 1: ConnectionState.java
 
 ```java
+package dev.redish;
+
+import java.nio.ByteBuffer;
+
 class ConnectionState {
-    ByteBuffer readBuf;    // accumulates incoming bytes
-    ByteBuffer writeBuf;   // pending bytes to send
-    // could add: partial parse state (e.g., RESP frame in progress)
+    static final int READ_BUF_SIZE = 8192;
+    static final int WRITE_BUF_SIZE = 65536;
+
+    ByteBuffer readBuf = ByteBuffer.allocate(READ_BUF_SIZE);
+    ByteBuffer writeBuf = ByteBuffer.allocate(WRITE_BUF_SIZE);
 }
 ```
 
-`SelectionKey.attach(state)` → retrieve with `key.attachment()`.
+---
 
-## Interaction with existing code
+## Step 2: RespParser.parse(ByteBuffer) — FINAL SPEC
 
-The tricky part: current `RespParser.parse(InputStream)` and `RespSerializer.serialize(Object, OutputStream)` work with blocking streams. NIO uses buffers.
+### Core rule
 
-**Two approaches:**
-
-### Option A: Bridge with Channels
-
-Wrap `SocketChannel` in an `InputStream`/`OutputStream`:
-- `Channels.newInputStream(socketChannel)` — but this blocks if no data available (defeats purpose)
-- Actually InputStream wrapper on non-blocking channel can return 0 / throw if no data
-
-This doesn't work cleanly because NIO is fundamentally non-blocking.
-
-### Option B: Rewrite protocol layer for ByteBuffer (recommended)
-
-Add non-blocking variants of parser/serializer that work with `ByteBuffer` directly:
+**Every method saves `int start = buf.position()` on entry.** If the data is incomplete, restore `buf.position(start)` and return `null`. This makes the parser fully idempotent — retrying after more data arrives re-parses from scratch, always correct.
 
 ```java
-// Current (blocking, InputStream based):
-public static Object parse(InputStream in) throws IOException
-
-// New (non-blocking, ByteBuffer based):
-public static Object parse(ByteBuffer buf)
-// Returns null if incomplete frame (need more data)
-// Returns parsed object if complete frame
-```
-
-Similarly for serializer:
-```java
-// Current:
-public static void serialize(Object obj, OutputStream out)
-
-// New — appends to ByteBuffer:
-public static void serialize(Object obj, ByteBuffer buf)
-```
-
-The event loop then:
-1. **read**: `socketChannel.read(readBuf)` → flip → `RespParser.parse(readBuf)` → if null (partial), compact and wait for more data; if complete, execute command → serialize into writeBuf
-2. **write**: `socketChannel.write(writeBuf)` → if remaining, keep OP_WRITE; if drained, switch to OP_READ
-
-This is how Redis itself works — it parses from an input buffer incrementally.
-
-## File changes needed
-
-### New file: `ConnectionState.java`
-
-```java
-class ConnectionState {
-    ByteBuffer readBuf = ByteBuffer.allocate(8192);
-    ByteBuffer writeBuf = ByteBuffer.allocate(8192);
+public static Object parse(ByteBuffer buf) {
+    if (buf.remaining() == 0) return null;
+    byte first = buf.get(buf.position());
+    return switch ((char) first) {
+        case '+' -> parseSimpleString(buf);
+        case '-' -> parseError(buf);
+        case ':' -> parseInteger(buf);
+        case '$' -> parseBulkString(buf);
+        case '*' -> parseArray(buf);
+        default -> throw new RespException("Unknown RESP type: " + (char) first);
+    };
 }
 ```
 
-### Modified: `RespParser.java`
+### parseLine — reads a `\r\n` terminated line
 
-Add overload:
+Scans with `buf.get(i)` (does not advance position). Only consumes bytes on a full match.
+
 ```java
-public static Object parse(ByteBuffer buf) { ... }
+private static String parseLine(ByteBuffer buf) {
+    int start = buf.position();
+    for (int i = start; i < buf.limit(); i++) {
+        if (buf.get(i) == '\r' && i + 1 < buf.limit() && buf.get(i + 1) == '\n') {
+            byte[] line = new byte[i - start];
+            buf.get(line);
+            buf.get(); // \r
+            buf.get(); // \n
+            return new String(line, StandardCharsets.UTF_8);
+        }
+    }
+    buf.position(start);
+    return null;
+}
 ```
-Returns `null` if complete RESP frame not yet available. Otherwise same logic but reads from buffer instead of InputStream.
 
-### Modified: `RespSerializer.java`
+### Parse methods for each RESP type
 
-Add overload:
 ```java
-public static void serialize(Object obj, ByteBuffer buf) { ... }
+private static String parseSimpleString(ByteBuffer buf) {
+    buf.get(); // consume '+'
+    return parseLine(buf);
+}
+
+private static String parseError(ByteBuffer buf) {
+    buf.get(); // consume '-'
+    return parseLine(buf);
+}
+
+private static Long parseInteger(ByteBuffer buf) {
+    buf.get(); // consume ':'
+    String line = parseLine(buf);
+    if (line == null) return null;
+    return Long.parseLong(line);
+}
+
+private static String parseBulkString(ByteBuffer buf) {
+    int start = buf.position();
+    buf.get(); // consume '$'
+    String lenStr = parseLine(buf);
+    if (lenStr == null) { buf.position(start); return null; }
+    int len = Integer.parseInt(lenStr);
+    if (len == -1) return null;
+    if (buf.remaining() < len + 2) { buf.position(start); return null; }
+    byte[] data = new byte[len];
+    buf.get(data);
+    buf.get(); // \r
+    buf.get(); // \n
+    return new String(data, StandardCharsets.UTF_8);
+}
+
+private static List<Object> parseArray(ByteBuffer buf) {
+    int start = buf.position();
+    buf.get(); // consume '*'
+    String lenStr = parseLine(buf);
+    if (lenStr == null) { buf.position(start); return null; }
+    int len = Integer.parseInt(lenStr);
+    if (len == -1) return null;
+    List<Object> list = new ArrayList<>(len);
+    for (int i = 0; i < len; i++) {
+        Object element = parse(buf);
+        if (element == null) { buf.position(start); return null; }
+        list.add(element);
+    }
+    return list;
+}
 ```
 
-### Modified: `RespType.java`
+### Design rationale
 
-Maybe no changes needed.
+- `parseLine` uses `buf.get(i)` peek — position never advances on null.
+- `parseBulkString` and `parseArray` both save position before consuming the type byte, restore on null.
+- If array element 2/3 is incomplete, `buf.position(start)` rewinds past the `*` line too. On retry, the whole array re-parses from the original `*`. All bytes are still in the buffer (nothing was compacted), so it works.
+- **No `mark()`/`reset()`** — plain `position()` save/restore everywhere.
+- **Exception rules**: `RespException` only for malformed data (bad int, unknown type byte, etc.). `null` means "need more bytes" — never throw for that.
+- Keep old `InputStream` methods — Client.java and tests still use them.
 
-### Rewrite: `Server.java`
+---
 
-Replace blocking `ServerSocket` + loop with NIO event loop.
+## Step 3: RespSerializer.serialize(Object, ByteBuffer)
 
-### Unchanged: `Client.java`, `Command.java`, commands, tests
+Appends to write-mode buffer (position = write cursor). Grows buffer if needed by reallocating.
 
-The command layer (`execute(List<Object> args)`) is pure logic — no I/O. Tests stay the same.
+```java
+public static void serialize(Object obj, ByteBuffer buf) {
+    if (obj == null) {
+        writeNullBulkString(buf);
+    } else if (obj instanceof String s) {
+        if (s.contains("\r") || s.contains("\n")) {
+            writeBulkString(s, buf);
+        } else {
+            writeSimpleString(s, buf);
+        }
+    } else if (obj instanceof Long l) {
+        writeInteger(l, buf);
+    } else if (obj instanceof ErrorResponse e) {
+        writeError(e.message(), buf);
+    } else if (obj instanceof List<?> list) {
+        writeArray(list, buf);
+    } else {
+        throw new IllegalArgumentException("Cannot serialize: " + obj.getClass());
+    }
+}
 
-## Edge cases
+private static void writeSimpleString(String s, ByteBuffer buf) {
+    ensureCapacity(buf, 1 + s.length() + 2);
+    buf.put((byte) '+');
+    buf.put(s.getBytes(StandardCharsets.UTF_8));
+    buf.put((byte) '\r');
+    buf.put((byte) '\n');
+}
+
+private static void writeError(String msg, ByteBuffer buf) {
+    ensureCapacity(buf, 1 + msg.length() + 2);
+    buf.put((byte) '-');
+    buf.put(msg.getBytes(StandardCharsets.UTF_8));
+    buf.put((byte) '\r');
+    buf.put((byte) '\n');
+}
+
+private static void writeInteger(long value, ByteBuffer buf) {
+    String s = Long.toString(value);
+    ensureCapacity(buf, 1 + s.length() + 2);
+    buf.put((byte) ':');
+    buf.put(s.getBytes(StandardCharsets.UTF_8));
+    buf.put((byte) '\r');
+    buf.put((byte) '\n');
+}
+
+private static void writeBulkString(String s, ByteBuffer buf) {
+    byte[] data = s.getBytes(StandardCharsets.UTF_8);
+    String lenStr = Integer.toString(data.length);
+    ensureCapacity(buf, 1 + lenStr.length() + 2 + data.length + 2);
+    buf.put((byte) '$');
+    buf.put(lenStr.getBytes(StandardCharsets.UTF_8));
+    buf.put((byte) '\r');
+    buf.put((byte) '\n');
+    buf.put(data);
+    buf.put((byte) '\r');
+    buf.put((byte) '\n');
+}
+
+private static void writeNullBulkString(ByteBuffer buf) {
+    ensureCapacity(buf, 5);
+    buf.put((byte) '$');
+    buf.put((byte) '-');
+    buf.put((byte) '1');
+    buf.put((byte) '\r');
+    buf.put((byte) '\n');
+}
+
+private static void writeArray(List<?> list, ByteBuffer buf) {
+    String lenStr = Integer.toString(list.size());
+    ensureCapacity(buf, 1 + lenStr.length() + 2);
+    buf.put((byte) '*');
+    buf.put(lenStr.getBytes(StandardCharsets.UTF_8));
+    buf.put((byte) '\r');
+    buf.put((byte) '\n');
+    for (Object element : list) {
+        serialize(element, buf);
+    }
+}
+
+private static void ensureCapacity(ByteBuffer buf, int needed) {
+    if (buf.remaining() < needed) {
+        ByteBuffer bigger = ByteBuffer.allocate(Math.max(buf.capacity() * 2, buf.position() + needed));
+        buf.flip();
+        bigger.put(buf);
+        buf = bigger; // NOTE: can't reassign parameter directly — return new buffer instead
+    }
+}
+```
+
+**Note on ensureCapacity**: ByteBuffer is passed by value (reference copied). Calling `ensureCapacity(buf, N)` can't reassign the caller's variable. Better approach — inline the check, or return a new buffer. Simplest for now: allocate `ConnectionState.writeBuf` at 64KB, and if it overflows, close the connection (log and cancel). Real implementation later.
+
+For this project: just let `BufferOverflowException` propagate and close the connection. Simple.
+
+---
+
+## Step 4: RespException.java
+
+```java
+package dev.redish.resp;
+
+public class RespException extends RuntimeException {
+    public RespException(String message) {
+        super(message);
+    }
+}
+```
+
+---
+
+## Step 5: Server.java — full event loop
+
+```java
+package dev.redish;
+
+import dev.redish.command.CommandRegistry;
+import dev.redish.resp.ErrorResponse;
+import dev.redish.resp.RespException;
+import dev.redish.resp.RespParser;
+import dev.redish.resp.RespSerializer;
+
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.util.Iterator;
+import java.util.List;
+
+public class Server {
+    private static final int PORT = 6380;
+    private final CommandRegistry registry = new CommandRegistry();
+
+    public void start() throws IOException {
+        Selector selector = Selector.open();
+        ServerSocketChannel ssc = ServerSocketChannel.open();
+        ssc.bind(new InetSocketAddress(PORT));
+        ssc.configureBlocking(false);
+        ssc.register(selector, SelectionKey.OP_ACCEPT);
+        System.out.println("[SERVER] Listening on port " + PORT);
+
+        while (true) {
+            selector.select();
+            Iterator<SelectionKey> it = selector.selectedKeys().iterator();
+            while (it.hasNext()) {
+                SelectionKey key = it.next();
+                it.remove();
+                try {
+                    if (key.isAcceptable()) {
+                        handleAccept(selector, ssc);
+                    } else if (key.isReadable()) {
+                        handleRead(key);
+                    } else if (key.isWritable()) {
+                        handleWrite(key);
+                    }
+                } catch (IOException e) {
+                    System.out.println("[SERVER] IO error: " + e.getMessage());
+                    closeConnection(key);
+                }
+            }
+        }
+    }
+
+    private void handleAccept(Selector selector, ServerSocketChannel ssc) throws IOException {
+        SocketChannel client = ssc.accept();
+        client.configureBlocking(false);
+        client.register(selector, SelectionKey.OP_READ, new ConnectionState());
+        System.out.println("[SERVER] Client connected: " + client.getRemoteAddress());
+    }
+
+    @SuppressWarnings("unchecked")
+    private void handleRead(SelectionKey key) throws IOException {
+        SocketChannel ch = (SocketChannel) key.channel();
+        ConnectionState st = (ConnectionState) key.attachment();
+
+        int n = ch.read(st.readBuf);
+        if (n == -1) {
+            closeConnection(key);
+            return;
+        }
+
+        st.readBuf.flip();
+        int start = st.readBuf.position();
+
+        Object parsed;
+        try {
+            parsed = RespParser.parse(st.readBuf);
+        } catch (RespException e) {
+            RespSerializer.serialize(new ErrorResponse("ERR " + e.getMessage()), st.writeBuf);
+            st.readBuf.compact();
+            key.interestOps(SelectionKey.OP_WRITE);
+            return;
+        }
+
+        if (parsed == null) {
+            st.readBuf.position(start);
+            st.readBuf.compact();
+            return;
+        }
+
+        if (!(parsed instanceof List<?> args) || args.isEmpty()) {
+            RespSerializer.serialize(new ErrorResponse("ERR invalid command format"), st.writeBuf);
+            st.readBuf.compact();
+            key.interestOps(SelectionKey.OP_WRITE);
+            return;
+        }
+
+        String cmdName = ((String) args.get(0)).toUpperCase();
+        List<Object> cmdArgs = args.subList(1, args.size());
+        var command = registry.getCommand(cmdName);
+        Object result = command.execute(cmdArgs);
+        RespSerializer.serialize(result, st.writeBuf);
+
+        st.readBuf.compact();
+        key.interestOps(SelectionKey.OP_WRITE);
+    }
+
+    private void handleWrite(SelectionKey key) throws IOException {
+        SocketChannel ch = (SocketChannel) key.channel();
+        ConnectionState st = (ConnectionState) key.attachment();
+
+        st.writeBuf.flip();
+        ch.write(st.writeBuf);
+
+        if (st.writeBuf.hasRemaining()) {
+            st.writeBuf.compact();
+        } else {
+            st.writeBuf.clear();
+            key.interestOps(SelectionKey.OP_READ);
+        }
+    }
+
+    private void closeConnection(SelectionKey key) throws IOException {
+        key.cancel();
+        if (key.channel() instanceof SocketChannel ch) {
+            System.out.println("[SERVER] Client disconnected: " + ch.getRemoteAddress());
+            ch.close();
+        }
+    }
+
+    public static void main(String[] args) throws IOException {
+        new Server().start();
+    }
+}
+```
+
+### Key details
+
+- `parsed == null` → restore position, compact, return. Buffer stays in write mode for next read.
+- `parsed instanceof List<?> args` → client must send RESP array.
+- `RespException` caught → serialize error response, switch to OP_WRITE.
+- `handleWrite` → flip (read mode), `channel.write()` may not drain all, compact rest.
+- `closeConnection` → cancel key + close channel, used for both disconnect and errors.
+
+---
+
+## Step 6: Edge cases
 
 | Case | Handling |
 |---|---|
-| Partial RESP frame (client sent half) | Parser returns null → stay in OP_READ, accumulate more bytes |
-| Client disconnects | `read()` returns -1 → cancel key, close channel |
-| Write buffer full | Stay in OP_WRITE mode, drain in chunks |
-| Multiple commands in one read (pipelining) | Loop `parse()` until null, then switch to OP_WRITE with all responses |
-| Client sends garbage | Parser throws → create error response, write back, close |
-| Large bulk strings (> 8KB buffer) | Grow buffer or use `read()` with remaining capacity |
+| Partial RESP frame | Parser returns null → compact, wait for more data |
+| Client disconnect | `read()` returns -1 → cancel key, close channel |
+| Garbage from client | `RespException` → write error response, switch to OP_WRITE |
+| Write buffer overflow | `BufferOverflowException` → propagate to outer try/catch, close connection |
+| Multiple pending accepts | Loop `ssc.accept()` until null |
 
-## Testing strategy
+---
 
-- Existing command unit tests unchanged
-- New: integration test with multiple `SocketChannel` clients connecting simultaneously, sending pipelined commands, verifying correct responses
-- Concurrency test: 10 clients connect, each sends 100 PINGs, verify all get correct responses (single-threaded but interleaved)
+## Summary of files
 
-## What you implement
+| File | Action |
+|---|---|
+| `src/main/java/dev/redish/ConnectionState.java` | Create |
+| `src/main/java/dev/redish/resp/RespException.java` | Create |
+| `src/main/java/dev/redish/resp/RespParser.java` | Add `parse(ByteBuffer)` overload (keep old method) |
+| `src/main/java/dev/redish/resp/RespSerializer.java` | Add `serialize(Object, ByteBuffer)` overload (keep old method) |
+| `src/main/java/dev/redish/Server.java` | Rewrite with NIO event loop |
 
-I suggest tackling in 5 steps:
+## Implementation order
 
-1. **Read/parse**: Add `ByteBuffer`-based `RespParser.parse(ByteBuffer)` returning null on partial frames
-2. **Serialize**: Add `ByteBuffer`-based `RespSerializer.serialize(Object, ByteBuffer)`
-3. **ConnectionState**: Per-key attachment
-4. **Event loop**: Replace Server.java with NIO selector loop
-5. **Test**: Manual test with `rcli` + `telnet` + second `rcli`
-
-Want me to review each step as you go? Or do the whole thing and then review at the end?
+1. **RespParser.parse(ByteBuffer)** — with idempotent rewind-on-null
+2. **RespSerializer.serialize(Object, ByteBuffer)** — buffer append methods
+3. **ConnectionState + RespException** — simple helper classes
+4. **Server.java** — NIO event loop
+5. **Manual test** — rserver + 3 rcli/telnet clients
