@@ -241,8 +241,8 @@ class RespByteBufferTest {
     // ─── Parser: unknown type byte throws ────────────────────────────
 
     @Test
-    void parseUnknownTypeThrows() {
-        assertThrows(RespException.class, () -> RespParser.parse(toBuf("~bad\r\n")));
+    void parseUnknownTypeAsInlineCommand() {
+        assertEquals(List.of("~bad"), RespParser.parse(toBuf("~bad\r\n")));
     }
 
     // ─── Parser: bulk string edge cases ──────────────────────────────

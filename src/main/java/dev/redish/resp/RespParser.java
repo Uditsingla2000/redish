@@ -126,14 +126,19 @@ public class RespParser {
     /** RESP type → parser method, null if incomplete. */
     public static Object parse(ByteBuffer buf) {
         if (buf.remaining() == 0) return null;
-        RespType type = RespType.fromByte(buf.get(buf.position()));
-        return switch (type) {
-            case SIMPLE_STRING -> parseSimpleString(buf);
-            case ERROR        -> parseError(buf);
-            case INTEGER      -> parseInteger(buf);
-            case BULK_STRING  -> parseBulkString(buf);
-            case ARRAY        -> parseArray(buf);
-        };
+        byte prefix = buf.get(buf.position());
+        if (isResTypeByte(prefix)) {
+            RespType type = RespType.fromByte(prefix);
+            return switch (type) {
+                case SIMPLE_STRING -> parseSimpleString(buf);
+                case ERROR        -> parseError(buf);
+                case INTEGER      -> parseInteger(buf);
+                case BULK_STRING  -> parseBulkString(buf);
+                case ARRAY        -> parseArray(buf);
+            };
+        }
+        // Inline command — not a RESP type marker, read as space-separated tokens
+        return parseInline(buf);
     }
 
     /** "+" → consume marker, read CRLF line. */
@@ -187,5 +192,59 @@ public class RespParser {
             list.add(element);
         }
         return list;
+    }
+
+    /** Returns true if the byte is a known RESP type prefix. */
+    private static boolean isResTypeByte(byte b) {
+        return b == '+' || b == '-' || b == ':' || b == '$' || b == '*';
+    }
+
+    /**
+     * Parse an inline command: read until CRLF (or LF), split on whitespace,
+     * return as a list of bulk-string tokens (same shape as a RESP array).
+     */
+    private static List<Object> parseInline(ByteBuffer buf) {
+        int start = buf.position();
+        // Scan for \r\n or \n
+        int lineEnd = -1;
+        int limit = buf.limit();
+        for (int i = start; i < limit; i++) {
+            byte b = buf.get(i);
+            if (b == '\r' && i + 1 < limit && buf.get(i + 1) == '\n') {
+                lineEnd = i;
+                break;
+            }
+            if (b == '\n') {
+                lineEnd = i;
+                break;
+            }
+        }
+        if (lineEnd == -1) {
+            buf.position(start);
+            return null;
+        }
+
+        // Extract the line content (without CR/LF)
+        int lineLen = lineEnd - start;
+        String line;
+        if (buf.get(lineEnd) == '\r') {
+            byte[] data = new byte[lineLen];
+            buf.get(data);
+            buf.get(); // \r
+            buf.get(); // \n
+            line = new String(data, StandardCharsets.UTF_8);
+        } else {
+            byte[] data = new byte[lineLen];
+            buf.get(data);
+            buf.get(); // \n
+            line = new String(data, StandardCharsets.UTF_8);
+        }
+
+        // Split on whitespace
+        String[] tokens = line.strip().split("\\s+");
+        if (tokens.length == 1 && tokens[0].isEmpty()) {
+            return List.of();
+        }
+        return List.of((Object[]) tokens);
     }
 }
