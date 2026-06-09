@@ -114,48 +114,54 @@ public class RespSerializer {
         }
     }
 
-    // ─── ByteBuffer-based serialization ───
+    // ─── ByteBuffer-based serialization (returns buffer, may reallocate) ───
 
-    public static void serialize(Object obj, ByteBuffer buf) {
-        if (obj instanceof ErrorResponse e)       { writeError(e.message(), buf); }
-        else if (obj instanceof String s)          { writeString(s, buf); }
-        else if (obj instanceof Long l)            { writeInteger(l, buf); }
-        else if (obj instanceof List<?> list)      { writeArray(list, buf); }
-        else if (obj == null)                      { writeNullBulkString(buf); }
-        else                                       { writeBulkString(obj.toString(), buf); }
-    }
-
-    private static void writeString(String s, ByteBuffer buf) {
-        if (s.indexOf('\r') >= 0 || s.indexOf('\n') >= 0) {
-            writeBulkString(s, buf);
-        } else {
-            writeSimpleString(s, buf);
+    public static ByteBuffer serialize(Object obj, ByteBuffer buf) {
+        if (obj instanceof ErrorResponse e)       { return writeError(e.message(), buf); }
+        if (obj instanceof Long l)                 { return writeInteger(l, buf); }
+        if (obj instanceof byte[] data)            { return writeBulkStringBytes(data, buf); }
+        if (obj instanceof String s) {
+            if (s.indexOf('\r') >= 0 || s.indexOf('\n') >= 0) {
+                return writeBulkString(s, buf);
+            }
+            return writeSimpleString(s, buf);
         }
+        if (obj instanceof List<?> list)           { return writeArray(list, buf); }
+        if (obj == null)                           { return writeNullBulkString(buf); }
+        return writeBulkString(obj.toString(), buf);
     }
 
-    private static void writeSimpleString(String s, ByteBuffer buf) {
+    private static ByteBuffer writeSimpleString(String s, ByteBuffer buf) {
+        buf = grow(buf, 1 + s.length() + 2);
         buf.put((byte) '+');
         buf.put(s.getBytes(StandardCharsets.UTF_8));
         buf.put((byte) '\r');
         buf.put((byte) '\n');
+        return buf;
     }
 
-    private static void writeError(String msg, ByteBuffer buf) {
+    private static ByteBuffer writeError(String msg, ByteBuffer buf) {
+        buf = grow(buf, 1 + msg.length() + 2);
         buf.put((byte) '-');
         buf.put(msg.getBytes(StandardCharsets.UTF_8));
         buf.put((byte) '\r');
         buf.put((byte) '\n');
+        return buf;
     }
 
-    private static void writeInteger(long value, ByteBuffer buf) {
+    private static ByteBuffer writeInteger(long value, ByteBuffer buf) {
+        String s = Long.toString(value);
+        buf = grow(buf, 1 + s.length() + 2);
         buf.put((byte) ':');
-        buf.put(Long.toString(value).getBytes(StandardCharsets.UTF_8));
+        buf.put(s.getBytes(StandardCharsets.UTF_8));
         buf.put((byte) '\r');
         buf.put((byte) '\n');
+        return buf;
     }
 
-    private static void writeBulkString(String s, ByteBuffer buf) {
+    private static ByteBuffer writeBulkString(String s, ByteBuffer buf) {
         byte[] data = s.getBytes(StandardCharsets.UTF_8);
+        buf = grow(buf, 1 + Integer.toString(data.length).length() + 2 + data.length + 2);
         buf.put((byte) '$');
         buf.put(Integer.toString(data.length).getBytes(StandardCharsets.UTF_8));
         buf.put((byte) '\r');
@@ -163,28 +169,53 @@ public class RespSerializer {
         buf.put(data);
         buf.put((byte) '\r');
         buf.put((byte) '\n');
+        return buf;
     }
 
-    private static void writeNullBulkString(ByteBuffer buf) {
+    private static ByteBuffer writeBulkStringBytes(byte[] data, ByteBuffer buf) {
+        buf = grow(buf, 1 + Integer.toString(data.length).length() + 2 + data.length + 2);
+        buf.put((byte) '$');
+        buf.put(Integer.toString(data.length).getBytes(StandardCharsets.UTF_8));
+        buf.put((byte) '\r');
+        buf.put((byte) '\n');
+        buf.put(data);
+        buf.put((byte) '\r');
+        buf.put((byte) '\n');
+        return buf;
+    }
+
+    private static ByteBuffer writeNullBulkString(ByteBuffer buf) {
+        buf = grow(buf, 5);
         buf.put((byte) '$');
         buf.put((byte) '-');
         buf.put((byte) '1');
         buf.put((byte) '\r');
         buf.put((byte) '\n');
+        return buf;
     }
 
-    @SuppressWarnings("unchecked")
-    private static void writeArray(List<?> list, ByteBuffer buf) {
-        if (list == null) {
-            writeNullBulkString(buf);
-            return;
-        }
+    private static ByteBuffer writeArray(List<?> list, ByteBuffer buf) {
+        if (list == null) return writeNullBulkString(buf);
+        buf = grow(buf, 1 + Integer.toString(list.size()).length() + 2);
         buf.put((byte) '*');
         buf.put(Integer.toString(list.size()).getBytes(StandardCharsets.UTF_8));
         buf.put((byte) '\r');
         buf.put((byte) '\n');
         for (Object elem : list) {
-            serialize(elem, buf);
+            buf = serialize(elem, buf);
         }
+        return buf;
+    }
+
+    private static ByteBuffer grow(ByteBuffer buf, int needed) {
+        if (buf.remaining() >= needed) return buf;
+        int newCap = buf.capacity();
+        while (buf.position() + needed > newCap) {
+            newCap = Math.max(newCap * 2, 64);
+        }
+        ByteBuffer bigger = ByteBuffer.allocate(newCap);
+        buf.flip();
+        bigger.put(buf);
+        return bigger;
     }
 }

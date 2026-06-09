@@ -197,101 +197,117 @@ private static List<Object> parseArray(ByteBuffer buf) {
 
 ## Step 3: RespSerializer.serialize(Object, ByteBuffer)
 
-Appends to write-mode buffer (position = write cursor). Grows buffer if needed by reallocating.
+Appends to write-mode buffer (position = write cursor). Each write method returns the buffer (possibly reallocated if capacity was exceeded).
 
 ```java
-public static void serialize(Object obj, ByteBuffer buf) {
+public static ByteBuffer serialize(Object obj, ByteBuffer buf) {
     if (obj == null) {
-        writeNullBulkString(buf);
+        return writeNullBulkString(buf);
+    } else if (obj instanceof ErrorResponse e) {
+        return writeError(e.message(), buf);
     } else if (obj instanceof String s) {
         if (s.contains("\r") || s.contains("\n")) {
-            writeBulkString(s, buf);
-        } else {
-            writeSimpleString(s, buf);
+            return writeBulkString(s, buf);
         }
+        return writeSimpleString(s, buf);
     } else if (obj instanceof Long l) {
-        writeInteger(l, buf);
-    } else if (obj instanceof ErrorResponse e) {
-        writeError(e.message(), buf);
+        return writeInteger(l, buf);
     } else if (obj instanceof List<?> list) {
-        writeArray(list, buf);
-    } else {
-        throw new IllegalArgumentException("Cannot serialize: " + obj.getClass());
+        return writeArray(list, buf);
     }
+    return writeBulkString(obj.toString(), buf);
 }
 
-private static void writeSimpleString(String s, ByteBuffer buf) {
-    ensureCapacity(buf, 1 + s.length() + 2);
+private static ByteBuffer writeSimpleString(String s, ByteBuffer buf) {
+    buf = grow(buf, 1 + s.length() + 2);
     buf.put((byte) '+');
     buf.put(s.getBytes(StandardCharsets.UTF_8));
     buf.put((byte) '\r');
     buf.put((byte) '\n');
+    return buf;
 }
 
-private static void writeError(String msg, ByteBuffer buf) {
-    ensureCapacity(buf, 1 + msg.length() + 2);
+private static ByteBuffer writeError(String msg, ByteBuffer buf) {
+    buf = grow(buf, 1 + msg.length() + 2);
     buf.put((byte) '-');
     buf.put(msg.getBytes(StandardCharsets.UTF_8));
     buf.put((byte) '\r');
     buf.put((byte) '\n');
+    return buf;
 }
 
-private static void writeInteger(long value, ByteBuffer buf) {
+private static ByteBuffer writeInteger(long value, ByteBuffer buf) {
     String s = Long.toString(value);
-    ensureCapacity(buf, 1 + s.length() + 2);
+    buf = grow(buf, 1 + s.length() + 2);
     buf.put((byte) ':');
     buf.put(s.getBytes(StandardCharsets.UTF_8));
     buf.put((byte) '\r');
     buf.put((byte) '\n');
+    return buf;
 }
 
-private static void writeBulkString(String s, ByteBuffer buf) {
+private static ByteBuffer writeBulkString(String s, ByteBuffer buf) {
     byte[] data = s.getBytes(StandardCharsets.UTF_8);
-    String lenStr = Integer.toString(data.length);
-    ensureCapacity(buf, 1 + lenStr.length() + 2 + data.length + 2);
+    buf = grow(buf, 1 + lenStr(data.length) + 2 + data.length + 2);
     buf.put((byte) '$');
-    buf.put(lenStr.getBytes(StandardCharsets.UTF_8));
+    buf.put(lenStr(data.length).getBytes(StandardCharsets.UTF_8));
     buf.put((byte) '\r');
     buf.put((byte) '\n');
     buf.put(data);
     buf.put((byte) '\r');
     buf.put((byte) '\n');
+    return buf;
 }
 
-private static void writeNullBulkString(ByteBuffer buf) {
-    ensureCapacity(buf, 5);
+private static ByteBuffer writeNullBulkString(ByteBuffer buf) {
+    buf = grow(buf, 5);
     buf.put((byte) '$');
     buf.put((byte) '-');
     buf.put((byte) '1');
     buf.put((byte) '\r');
     buf.put((byte) '\n');
+    return buf;
 }
 
-private static void writeArray(List<?> list, ByteBuffer buf) {
-    String lenStr = Integer.toString(list.size());
-    ensureCapacity(buf, 1 + lenStr.length() + 2);
+private static ByteBuffer writeArray(List<?> list, ByteBuffer buf) {
+    if (list == null) return writeNullBulkString(buf);
+    buf = grow(buf, 2 + lenStr(list.size()) + 2);
     buf.put((byte) '*');
-    buf.put(lenStr.getBytes(StandardCharsets.UTF_8));
+    buf.put(lenStr(list.size()).getBytes(StandardCharsets.UTF_8));
     buf.put((byte) '\r');
     buf.put((byte) '\n');
-    for (Object element : list) {
-        serialize(element, buf);
+    for (Object elem : list) {
+        buf = serialize(elem, buf);
     }
+    return buf;
 }
 
-private static void ensureCapacity(ByteBuffer buf, int needed) {
-    if (buf.remaining() < needed) {
-        ByteBuffer bigger = ByteBuffer.allocate(Math.max(buf.capacity() * 2, buf.position() + needed));
-        buf.flip();
-        bigger.put(buf);
-        buf = bigger; // NOTE: can't reassign parameter directly — return new buffer instead
+/** Double capacity until at least `needed` bytes fit. */
+private static ByteBuffer grow(ByteBuffer buf, int needed) {
+    if (buf.remaining() >= needed) return buf;
+    int newCap = buf.capacity();
+    while (buf.position() + needed > newCap) {
+        newCap = Math.max(newCap * 2, 64);
     }
+    ByteBuffer bigger = ByteBuffer.allocate(newCap);
+    buf.flip();
+    bigger.put(buf);
+    return bigger;
+}
+
+private static String lenStr(int len) {
+    return Integer.toString(len);
 }
 ```
 
-**Note on ensureCapacity**: ByteBuffer is passed by value (reference copied). Calling `ensureCapacity(buf, N)` can't reassign the caller's variable. Better approach — inline the check, or return a new buffer. Simplest for now: allocate `ConnectionState.writeBuf` at 64KB, and if it overflows, close the connection (log and cancel). Real implementation later.
+Caller in Server.java updates its state reference:
 
-For this project: just let `BufferOverflowException` propagate and close the connection. Simple.
+```java
+ConnectionState st = (ConnectionState) key.attachment();
+st.writeBuf = RespSerializer.serialize(result, st.writeBuf);
+```
+
+Now any response size works — buffer grows as needed. No crash on large values.
 
 ---
 
@@ -389,7 +405,7 @@ public class Server {
         try {
             parsed = RespParser.parse(st.readBuf);
         } catch (RespException e) {
-            RespSerializer.serialize(new ErrorResponse("ERR " + e.getMessage()), st.writeBuf);
+            st.writeBuf = RespSerializer.serialize(new ErrorResponse("ERR " + e.getMessage()), st.writeBuf);
             st.readBuf.compact();
             key.interestOps(SelectionKey.OP_WRITE);
             return;
@@ -402,17 +418,18 @@ public class Server {
         }
 
         if (!(parsed instanceof List<?> args) || args.isEmpty()) {
-            RespSerializer.serialize(new ErrorResponse("ERR invalid command format"), st.writeBuf);
+            st.writeBuf = RespSerializer.serialize(new ErrorResponse("ERR invalid command format"), st.writeBuf);
             st.readBuf.compact();
             key.interestOps(SelectionKey.OP_WRITE);
             return;
         }
 
         String cmdName = ((String) args.get(0)).toUpperCase();
-        List<Object> cmdArgs = args.subList(1, args.size());
-        var command = registry.getCommand(cmdName);
+        var command = registry.get(cmdName);
+        @SuppressWarnings("unchecked")
+        List<Object> cmdArgs = (List<Object>) args;
         Object result = command.execute(cmdArgs);
-        RespSerializer.serialize(result, st.writeBuf);
+        st.writeBuf = RespSerializer.serialize(result, st.writeBuf);
 
         st.readBuf.compact();
         key.interestOps(SelectionKey.OP_WRITE);
@@ -452,6 +469,8 @@ public class Server {
 - `parsed == null` → restore position, compact, return. Buffer stays in write mode for next read.
 - `parsed instanceof List<?> args` → client must send RESP array.
 - `RespException` caught → serialize error response, switch to OP_WRITE.
+- `command.execute(args)` — args includes command name at index 0, same contract as before.
+- `registry.get(name)` maps name → handler, falls back to UnknownCommand automatically.
 - `handleWrite` → flip (read mode), `channel.write()` may not drain all, compact rest.
 - `closeConnection` → cancel key + close channel, used for both disconnect and errors.
 
@@ -464,7 +483,7 @@ public class Server {
 | Partial RESP frame | Parser returns null → compact, wait for more data |
 | Client disconnect | `read()` returns -1 → cancel key, close channel |
 | Garbage from client | `RespException` → write error response, switch to OP_WRITE |
-| Write buffer overflow | `BufferOverflowException` → propagate to outer try/catch, close connection |
+| Write buffer full | `grow()` reallocates — never overflows |
 | Multiple pending accepts | Loop `ssc.accept()` until null |
 
 ---
