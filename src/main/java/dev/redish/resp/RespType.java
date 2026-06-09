@@ -30,6 +30,6 @@ public enum RespType {
                 return type;
             }
         }
-        throw new IllegalArgumentException("Unknown RESP type identifier: " + c);
+        throw new RespException("Unknown RESP type identifier: " + c);
     }
 }

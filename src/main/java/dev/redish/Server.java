@@ -54,10 +54,12 @@ public class Server {
     }
 
     private void handleAccept(Selector selector, ServerSocketChannel ssc) throws IOException {
-        SocketChannel client = ssc.accept();
-        client.configureBlocking(false);
-        client.register(selector, SelectionKey.OP_READ, new ConnectionState());
-        System.out.println("[SERVER] Client connected: " + client.getRemoteAddress());
+        SocketChannel client;
+        while ((client = ssc.accept()) != null) {
+            client.configureBlocking(false);
+            client.register(selector, SelectionKey.OP_READ, new ConnectionState());
+            System.out.println("[SERVER] Client connected: " + client.getRemoteAddress());
+        }
     }
 
     private void handleRead(SelectionKey key) throws IOException {

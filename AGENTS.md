@@ -15,7 +15,7 @@ mvn compile
 mvn exec:java -Dexec.mainClass=dev.redish.Server
 mvn exec:java -Dexec.mainClass=dev.redish.Client
 
-mvn test         # run all tests
+mvn test         # run all tests (54 total)
 ```
 
 No Maven wrapper — requires `mvn` on `$PATH`. Java 24.
@@ -28,34 +28,38 @@ No Maven wrapper — requires `mvn` on `$PATH`. Java 24.
 
 | Package | What |
 |---|---|
-| `dev.redish` | Entrypoints — `Server` (TCP listener), `Client` (interactive CLI) |
+| `dev.redish` | Entrypoints — `Server` (NIO event loop), `Client` (interactive CLI), `ConnectionState` |
 | `dev.redish.command` | Command pattern — `Command` interface, `PingCommand`, `CommandRegistry`, `UnknownCommand` |
-| `dev.redish.resp` | RESP protocol — `RespType`, `RespParser`, `RespSerializer`, `ErrorResponse` |
+| `dev.redish.resp` | RESP protocol — `RespType`, `RespParser`, `RespSerializer`, `ErrorResponse`, `RespException` |
 
 ## Design patterns used
 
 - **Command Pattern** — `Command` interface, each command is a class. Registry maps name → handler.
-- **ErrorResponse record** — errors returned as `ErrorResponse` record, auto-serialized by `RespSerializer` as `-ERR...\r\n`. No public writeError needed.
+- **ErrorResponse record** — errors returned as `ErrorResponse` record, auto-serialized by `RespSerializer`.
+- **I/O Multiplexing** — single-threaded NIO `Selector` event loop (kqueue on macOS, epoll on Linux).
+- **ByteBuffer Parser** — idempotent rewind-on-null pattern for non-blocking parsing.
 
 ## RESP protocol layer
 
-- `RespParser.parse(InputStream)` → returns `String`, `Long`, `List<Object>`, or `null`
-- `RespSerializer.serialize(Object, OutputStream)` — writes RESP wire format
-- `RespSerializer.serialize(new ErrorResponse("ERR ..."), out)` — writes `-ERR ...\r\n`
+- `RespParser.parse(InputStream)` — blocking, used by `Client.java`
+- `RespParser.parse(ByteBuffer)` — non-blocking, used by `Server.java`, returns null on partial frames
+- `RespSerializer.serialize(Object, OutputStream)` — blocking, used by `Client.java`
+- `RespSerializer.serialize(Object, ByteBuffer)` — non-blocking, returns (possibly reallocated) buffer, used by `Server.java`
+- `grow()` — dynamically doubles buffer capacity, no size limit on responses
 - Simple strings auto-upgrade to bulk strings when content contains CR/LF
 - Null bulk string (`$-1\r\n`) and null array (`*-1\r\n`) supported
-- Not binary-safe (bulk strings decoded as UTF-8)
+- `RespException` for protocol errors (bad type byte, malformed data)
 
 ## Testing
 
-JUnit 5 + Surefire. Tests at `src/test/java/`.
-Run all: `mvn test`
-Current count: 22 tests (RespParser, RespSerializer, PingCommand, CommandRegistry)
+JUnit 5 + Surefire. Run all: `mvn test`
+Current count: **54 tests** — 13 InputStream parser, 32 ByteBuffer parser+serializer, 1 OutputStream serializer, 4 PingCommand, 4 CommandRegistry
 
 ## Current state
 
-- Server reads RESP from client, dispatches via CommandRegistry, writes RESP response
-- Client sends tokenized commands as RESP arrays, displays responses
-- PING → `+PONG`, PING \<arg\> → `$<len>\r\n<arg>\r\n`, PING with >1 arg → error
+- **Server**: NIO `Selector` event loop — single-threaded, handles many concurrent clients
+- **Client**: blocking RESP CLI, interactive loop
+- **PING** → `+PONG`, `PING <arg>` → bulk string, `PING` with >1 arg → error
 - Unknown commands → `-ERR unknown command '...'`
-- Server handles one client at a time (sequential, blocking I/O)
+- Dynamic buffer growth — no limit on response size
+- Accept queue drained in loop — handles burst connections
