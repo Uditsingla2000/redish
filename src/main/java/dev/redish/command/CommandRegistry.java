@@ -10,10 +10,12 @@ public class CommandRegistry {
     private final Map<String, Command> commands = new HashMap<>();
 
     public CommandRegistry(Store store) {
-        register("PING", new PingCommand());
-        register("SET",  new SetCommand(store));
-        register("GET",  new GetCommand(store));
-        register("TTL",  new TtlCommand(store));
+        register("PING",   new PingCommand());
+        register("SET",    new SetCommand(store));
+        register("GET",    new GetCommand(store));
+        register("TTL",    new TtlCommand(store));
+        register("DEL",    new DelCommand(store));
+        register("EXPIRE", new ExpireCommand(store));
     }
 
     public void register(String name, Command command) {

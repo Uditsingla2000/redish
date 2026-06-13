@@ -172,8 +172,9 @@ public class RespParser {
         if (buf.remaining() < len + 2) { buf.position(start); return null; }
         byte[] data = new byte[len];
         buf.get(data);
-        buf.get(); // \r
-        buf.get(); // \n
+        if (buf.get() != '\r' || buf.get() != '\n') {
+            throw new RespException("Bulk string not terminated with CRLF");
+        }
         return new String(data, StandardCharsets.UTF_8);
     }
 

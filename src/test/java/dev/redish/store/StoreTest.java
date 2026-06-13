@@ -68,4 +68,42 @@ class StoreTest {
         long ttl = store.ttl("k");
         assertTrue(ttl == 0 || ttl == 1);
     }
+
+    @Test
+    void delExisting() {
+        store.set("k", "v".getBytes());
+        assertEquals(1, store.del("k"));
+        assertNull(store.get("k"));
+    }
+
+    @Test
+    void delMissing() {
+        assertEquals(0, store.del("nope"));
+    }
+
+    @Test
+    void delExpired() throws InterruptedException {
+        store.setex("tmp", "x".getBytes(), 50);
+        Thread.sleep(100);
+        assertEquals(0, store.del("tmp"));
+    }
+
+    @Test
+    void expireExisting() {
+        store.set("k", "v".getBytes());
+        assertTrue(store.expire("k", 5000));
+        assertTrue(store.ttl("k") > 0);
+    }
+
+    @Test
+    void expireMissing() {
+        assertFalse(store.expire("nope", 5000));
+    }
+
+    @Test
+    void expireAlreadyExpired() throws InterruptedException {
+        store.setex("tmp", "x".getBytes(), 50);
+        Thread.sleep(100);
+        assertFalse(store.expire("tmp", 5000));
+    }
 }

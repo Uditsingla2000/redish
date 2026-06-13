@@ -747,3 +747,145 @@ The serializer already handles all these types.
 - `TtlCommandTest`: no-expiry/expired/remaining
 - Manual: `rcli` with `SET key value EX 2` → `GET key` → wait 3s → `GET key` (should return null)
 
+---
+
+# DEL / EXPIRE — key deletion and expiry management
+
+## Wire format
+
+```
+DEL key [key ...]
+  → :<count>\r\n    (number of keys deleted)
+
+EXPIRE key seconds
+  → :1\r\n          (expiry set)
+  → :0\r\n          (key does not exist)
+  → -ERR wrong number of arguments for 'EXPIRE' command\r\n
+  → -ERR value is not an integer or out of range\r\n
+```
+
+## Store changes
+
+Add two methods to `Store.java`:
+
+```java
+public long del(String key) {
+    Value v = map.remove(key);
+    return v != null && !v.isExpired() ? 1 : 0;
+}
+
+public long del(List<String> keys) {
+    return keys.stream().mapToLong(this::del).sum();
+}
+
+public boolean expire(String key, long ttlMillis) {
+    Value v = map.get(key);
+    if (v == null || v.isExpired()) return false;
+    map.put(key, new Value(v.data, System.currentTimeMillis() + ttlMillis));
+    return true;
+}
+```
+
+Note: `del` checks `isExpired()` so already-expired keys count as not deleted (returns 0).
+
+## Commands
+
+### `DelCommand.java`
+
+```java
+package dev.redish.command;
+
+import dev.redish.resp.ErrorResponse;
+import dev.redish.store.Store;
+import java.util.List;
+import java.util.ArrayList;
+
+public class DelCommand implements Command {
+    private final Store store;
+    public DelCommand(Store store) { this.store = store; }
+
+    @Override
+    public Object execute(List<Object> args) {
+        if (args.size() < 2) {
+            return new ErrorResponse("ERR wrong number of arguments for 'DEL' command");
+        }
+        long count = 0;
+        for (int i = 1; i < args.size(); i++) {
+            count += store.del((String) args.get(i));
+        }
+        return count;
+    }
+}
+```
+
+### `ExpireCommand.java`
+
+```java
+package dev.redish.command;
+
+import dev.redish.resp.ErrorResponse;
+import dev.redish.store.Store;
+import java.util.List;
+
+public class ExpireCommand implements Command {
+    private final Store store;
+    public ExpireCommand(Store store) { this.store = store; }
+
+    @Override
+    public Object execute(List<Object> args) {
+        if (args.size() != 3) {
+            return new ErrorResponse("ERR wrong number of arguments for 'EXPIRE' command");
+        }
+        try {
+            long seconds = Long.parseLong((String) args.get(2));
+            return store.expire((String) args.get(1), seconds * 1000) ? 1L : 0L;
+        } catch (NumberFormatException e) {
+            return new ErrorResponse("ERR value is not an integer or out of range");
+        }
+    }
+}
+```
+
+## Register in `CommandRegistry`
+
+```java
+register("DEL",    new DelCommand(store));
+register("EXPIRE", new ExpireCommand(store));
+```
+
+## RESP types returned
+
+| Command | Returns |
+|---|---|
+| DEL hit | `Long` count → `:<n>\r\n` |
+| DEL no keys | `Long 0` → `:0\r\n` |
+| EXPIRE set | `Long 1` → `:1\r\n` |
+| EXPIRE key missing | `Long 0` → `:0\r\n` |
+
+## File changes
+
+| File | Action |
+|---|---|
+| `src/main/java/dev/redish/store/Store.java` | Add `del(key)`, `del(keys)`, `expire(key, ttlMillis)` |
+| `src/main/java/dev/redish/command/DelCommand.java` | Create |
+| `src/main/java/dev/redish/command/ExpireCommand.java` | Create |
+| `src/main/java/dev/redish/command/CommandRegistry.java` | Register DEL and EXPIRE |
+| `src/test/java/dev/redish/store/StoreTest.java` | Add del/expire tests |
+| `src/test/java/dev/redish/command/DelCommandTest.java` | Create |
+| `src/test/java/dev/redish/command/ExpireCommandTest.java` | Create |
+
+## Edge cases
+
+| Case | Handling |
+|---|---|
+| DEL missing key | Returns `0` |
+| DEL expired key | Returns `0` (expired counted as not existing) |
+| DEL multiple keys | Returns count of non-expired deleted keys |
+| DEL no args | Error: wrong number of arguments |
+| EXPIRE on missing key | Returns `0` |
+| EXPIRE on expired key | Returns `0` (lazy expiry before setting) |
+| EXPIRE negative seconds | `Long.parseLong` accepts negative → stored as negative TTL → immediately expired |
+| EXPIRE overwrite existing expiry | Replaces old expiry with new one |
+| EXPIRE non-integer seconds | Error: not an integer |
+
+
