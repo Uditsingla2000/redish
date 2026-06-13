@@ -5,11 +5,12 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.util.List;
 
 import dev.redish.resp.ErrorResponse;
+import dev.redish.store.Store;
 import org.junit.jupiter.api.Test;
 
 class CommandRegistryTest {
 
-    private final CommandRegistry registry = new CommandRegistry();
+    private final CommandRegistry registry = new CommandRegistry(new Store());
 
     @Test
     void getPing() {

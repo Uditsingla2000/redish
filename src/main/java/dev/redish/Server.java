@@ -5,6 +5,7 @@ import dev.redish.resp.ErrorResponse;
 import dev.redish.resp.RespException;
 import dev.redish.resp.RespParser;
 import dev.redish.resp.RespSerializer;
+import dev.redish.store.Store;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -17,7 +18,8 @@ import java.util.List;
 
 public class Server {
     private static final int PORT = 6380;
-    private final CommandRegistry registry = new CommandRegistry();
+    private final Store store = new Store();
+    private final CommandRegistry registry = new CommandRegistry(store);
 
     public void start() throws IOException {
         Selector selector = Selector.open();
@@ -30,6 +32,7 @@ public class Server {
         System.out.println("─".repeat(48));
         System.out.printf("  Server listening on port %d%n", PORT);
         System.out.println("─".repeat(48));
+        Log.info("Server started on port " + PORT);
 
         while (true) {
             selector.select();
@@ -46,7 +49,7 @@ public class Server {
                         handleWrite(key);
                     }
                 } catch (IOException e) {
-                    System.out.println("[SERVER] IO error: " + e.getMessage());
+                    Log.info("IO error: " + e.getMessage());
                     closeConnection(key);
                 }
             }
@@ -58,7 +61,7 @@ public class Server {
         while ((client = ssc.accept()) != null) {
             client.configureBlocking(false);
             client.register(selector, SelectionKey.OP_READ, new ConnectionState());
-            System.out.println("[SERVER] Client connected: " + client.getRemoteAddress());
+            Log.info("Client connected: " + client.getRemoteAddress());
         }
     }
 
@@ -127,7 +130,7 @@ public class Server {
     private void closeConnection(SelectionKey key) throws IOException {
         key.cancel();
         if (key.channel() instanceof SocketChannel ch) {
-            System.out.println("[SERVER] Client disconnected: " + ch.getRemoteAddress());
+            Log.info("Client disconnected: " + ch.getRemoteAddress());
             ch.close();
         }
     }

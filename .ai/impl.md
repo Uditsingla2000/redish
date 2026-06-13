@@ -507,3 +507,243 @@ public class Server {
 3. **ConnectionState + RespException** — simple helper classes
 4. **Server.java** — NIO event loop
 5. **Manual test** — rserver + 3 rcli/telnet clients
+
+---
+
+# SET / GET / TTL — in-memory store with expiry
+
+## Wire format
+
+```
+SET key value [EX seconds]
+  → +OK\r\n
+  → -ERR wrong number of arguments for 'SET' command\r\n
+  → -ERR value is not an integer or out of range\r\n  (bad EX value)
+
+GET key
+  → $<len>\r\n<value>\r\n    (key exists)
+  → $-1\r\n                  (key missing or expired)
+
+TTL key
+  → :<ttl>\r\n               (positive = seconds remaining)
+  → :-1\r\n                  (key has no expiry, or key missing)
+```
+
+## Store: `Store.java`
+
+A shared key-value store accessed by all command handlers. Single-threaded event loop means no locks needed.
+
+```java
+package dev.redish.store;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class Store {
+
+    private record Value(Object data, long expiresAt) {
+        boolean isExpired() { return expiresAt != -1 && System.currentTimeMillis() > expiresAt; }
+    }
+
+    private final Map<String, Value> map = new HashMap<>();
+
+    public void set(String key, Object value) {
+        map.put(key, new Value(value, -1));
+    }
+
+    public void setex(String key, Object value, long ttlMillis) {
+        map.put(key, new Value(value, System.currentTimeMillis() + ttlMillis));
+    }
+
+    public Object get(String key) {
+        Value v = map.get(key);
+        if (v == null) return null;
+        if (v.isExpired()) { map.remove(key); return null; }
+        return v.data;
+    }
+
+    public long ttl(String key) {
+        Value v = map.get(key);
+        if (v == null) return -1;
+        if (v.isExpired()) { map.remove(key); return -1; }
+        if (v.expiresAt == -1) return -1;
+        return (v.expiresAt - System.currentTimeMillis() + 999) / 1000;
+    }
+}
+```
+
+### Expiry strategy: lazy
+
+Check expiration on every `GET`/`TTL`. No background thread. Expired keys are purged on access. This is what Redis does for keys that aren't touched by the active expire cycle.
+
+## Commands
+
+### `SetCommand.java`
+
+```java
+package dev.redish.command;
+
+import dev.redish.resp.ErrorResponse;
+import dev.redish.store.Store;
+import java.util.List;
+
+public class SetCommand implements Command {
+    private final Store store;
+
+    public SetCommand(Store store) {
+        this.store = store;
+    }
+
+    @Override
+    public Object execute(List<Object> args) {
+        // args = ["SET", "key", "value"] or ["SET", "key", "value", "EX", "seconds"]
+        if (args.size() < 3 || args.size() == 4 || args.size() > 5) {
+            return new ErrorResponse("ERR wrong number of arguments for 'SET' command");
+        }
+
+        String key = (String) args.get(1);
+        byte[] value = ((String) args.get(2)).getBytes(StandardCharsets.UTF_8);
+
+        if (args.size() == 5) {
+            if (!"EX".equalsIgnoreCase((String) args.get(3))) {
+                return new ErrorResponse("ERR syntax error");
+            }
+            try {
+                long seconds = Long.parseLong((String) args.get(4));
+                if (seconds <= 0) {
+                    return new ErrorResponse("ERR invalid expire time in 'SET' command");
+                }
+                store.setex(key, value, seconds * 1000);
+            } catch (NumberFormatException e) {
+                return new ErrorResponse("ERR value is not an integer or out of range");
+            }
+        } else {
+            store.set(key, value);
+        }
+        return "OK";
+    }
+}
+```
+
+### `GetCommand.java`
+
+```java
+package dev.redish.command;
+
+import dev.redish.resp.ErrorResponse;
+import dev.redish.store.Store;
+import java.util.List;
+
+public class GetCommand implements Command {
+    private final Store store;
+
+    public GetCommand(Store store) { this.store = store; }
+
+    @Override
+    public Object execute(List<Object> args) {
+        if (args.size() != 2) {
+            return new ErrorResponse("ERR wrong number of arguments for 'GET' command");
+        }
+        String key = (String) args.get(1);
+        return store.get(key); // null → $-1, byte[] → bulk string
+    }
+}
+```
+
+### `TtlCommand.java`
+
+```java
+package dev.redish.command;
+
+import dev.redish.resp.ErrorResponse;
+import dev.redish.store.Store;
+import java.util.List;
+
+public class TtlCommand implements Command {
+    private final Store store;
+
+    public TtlCommand(Store store) { this.store = store; }
+
+    @Override
+    public Object execute(List<Object> args) {
+        if (args.size() != 2) {
+            return new ErrorResponse("ERR wrong number of arguments for 'TTL' command");
+        }
+        String key = (String) args.get(1);
+        return store.ttl(key); // returns Long
+    }
+}
+```
+
+### Register in `CommandRegistry`
+
+`CommandRegistry` needs to accept a `Store` instance and register the new commands:
+
+```java
+public CommandRegistry(Store store) {
+    register("PING", new PingCommand());
+    register("SET",  new SetCommand(store));
+    register("GET",  new GetCommand(store));
+    register("TTL",  new TtlCommand(store));
+}
+```
+
+The existing no-arg constructor can default to a new Store for backward compat, or just update the one usage in Server.java.
+
+### Update `Server.java`
+
+```java
+private final Store store = new Store();
+private final CommandRegistry registry = new CommandRegistry(store);
+```
+
+## What RESP type to return
+
+| Command | Returns |
+|---|---|
+| SET OK | `String "OK"` → `+OK\r\n` |
+| SET error | `ErrorResponse` → `-ERR ...\r\n` |
+| GET hit | `byte[]` → `$<len>\r\n...\r\n` |
+| GET miss | `null` → `$-1\r\n` |
+| TTL | `Long` → `:<ttl>\r\n` |
+
+The serializer already handles all these types.
+
+## File changes
+
+| File | Action |
+|---|---|
+| `src/main/java/dev/redish/store/Store.java` | Create |
+| `src/main/java/dev/redish/command/SetCommand.java` | Create |
+| `src/main/java/dev/redish/command/GetCommand.java` | Create |
+| `src/main/java/dev/redish/command/TtlCommand.java` | Create |
+| `src/main/java/dev/redish/command/CommandRegistry.java` | Add `Store` param, register new commands |
+| `src/main/java/dev/redish/Server.java` | Create `Store`, pass to `CommandRegistry` |
+| `src/test/java/dev/redish/store/StoreTest.java` | Create (tests for set/get/ttl/expiry) |
+| `src/test/java/dev/redish/command/SetCommandTest.java` | Create |
+| `src/test/java/dev/redish/command/GetCommandTest.java` | Create |
+| `src/test/java/dev/redish/command/TtlCommandTest.java` | Create |
+
+## Edge cases
+
+| Case | Handling |
+|---|---|
+| SET with EX 0 | Error: "invalid expire time in 'SET' command" |
+| SET with EX -1 | Error (parsed as invalid) |
+| SET with EX "abc" | Error: "value is not an integer or out of range" |
+| SET without value | Error: "wrong number of arguments" |
+| GET expired key | `null` → `$-1\r\n` (lazy expiry) |
+| GET nonexistent key | `null` → `$-1\r\n` |
+| TTL on key with no expiry | `-1` |
+| TTL on expired/missing key | `-1` |
+| TTL on key with expiry | Seconds remaining (rounded up) |
+| SET twice (overwrite) | New value + new expiry if EX given |
+
+## Testing strategy
+
+- `StoreTest`: unit test store in isolation (set/get/ttl/expiry)
+- `SetCommandTest`: verify args parsing, EX option, error responses
+- `GetCommandTest`: hit/miss/wrong-args
+- `TtlCommandTest`: no-expiry/expired/remaining
+- Manual: `rcli` with `SET key value EX 2` → `GET key` → wait 3s → `GET key` (should return null)
+

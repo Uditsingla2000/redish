@@ -3,12 +3,17 @@ package dev.redish.command;
 import java.util.HashMap;
 import java.util.Map;
 
+import dev.redish.store.Store;
+
 public class CommandRegistry {
 
     private final Map<String, Command> commands = new HashMap<>();
 
-    public CommandRegistry() {
+    public CommandRegistry(Store store) {
         register("PING", new PingCommand());
+        register("SET",  new SetCommand(store));
+        register("GET",  new GetCommand(store));
+        register("TTL",  new TtlCommand(store));
     }
 
     public void register(String name, Command command) {
