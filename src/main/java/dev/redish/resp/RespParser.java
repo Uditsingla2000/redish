@@ -167,7 +167,12 @@ public class RespParser {
         buf.get(); // consume '$'
         String lenStr = parseLine(buf);
         if (lenStr == null) { buf.position(start); return null; }
-        int len = Integer.parseInt(lenStr);
+        int len = 0;
+        try {
+            len = Integer.parseInt(lenStr);
+        } catch (NumberFormatException e) {
+            throw new RespException("Invalid bulk string length: " + lenStr);
+        }
         if (len == -1) return null;
         if (buf.remaining() < len + 2) { buf.position(start); return null; }
         byte[] data = new byte[len];
@@ -184,7 +189,12 @@ public class RespParser {
         buf.get(); // consume '*'
         String lenStr = parseLine(buf);
         if (lenStr == null) { buf.position(start); return null; }
-        int len = Integer.parseInt(lenStr);
+        int len = 0;
+        try {
+            len = Integer.parseInt(lenStr);
+        } catch (NumberFormatException e) {
+            throw new RespException("Invalid array length: " + lenStr);
+        }
         if (len == -1) return null;
         List<Object> list = new ArrayList<>(len);
         for (int i = 0; i < len; i++) {

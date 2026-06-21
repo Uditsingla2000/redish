@@ -76,37 +76,37 @@ public class Server {
         }
 
         st.readBuf.flip();
-        int start = st.readBuf.position();
 
-        Object parsed;
-        try {
-            parsed = RespParser.parse(st.readBuf);
-        } catch (RespException e) {
-            st.writeBuf = RespSerializer.serialize(new ErrorResponse("ERR " + e.getMessage()), st.writeBuf);
-            st.readBuf.compact();
-            key.interestOps(SelectionKey.OP_WRITE);
-            return;
+        int processed = 0;
+        while (processed++ < 5000) {
+            int start = st.readBuf.position();
+            Object parsed;
+
+            try {
+                parsed = RespParser.parse(st.readBuf);
+            } catch (RespException e) {
+                st.writeBuf = RespSerializer.serialize(
+                    new ErrorResponse("ERR " + e.getMessage()), st.writeBuf);
+                st.readBuf.compact();
+                key.interestOps(SelectionKey.OP_WRITE);
+                return;
+            }
+
+            if (parsed == null) {
+                st.readBuf.position(start);
+                break;
+            }
+
+            if (!(parsed instanceof List<?> args) || args.isEmpty()) {
+                st.writeBuf = RespSerializer.serialize(
+                    new ErrorResponse("ERR expected array"), st.writeBuf);
+                break;
+            }
+
+            String cmdName = ((String) args.get(0)).toUpperCase();
+            Object result = registry.get(cmdName).execute((List<Object>) args);
+            st.writeBuf = RespSerializer.serialize(result, st.writeBuf);
         }
-
-        if (parsed == null) {
-            st.readBuf.position(start);
-            st.readBuf.compact();
-            return;
-        }
-
-        if (!(parsed instanceof List<?> args) || args.isEmpty()) {
-            st.writeBuf = RespSerializer.serialize(new ErrorResponse("ERR expected array"), st.writeBuf);
-            st.readBuf.compact();
-            key.interestOps(SelectionKey.OP_WRITE);
-            return;
-        }
-
-        String cmdName = ((String) args.get(0)).toUpperCase();
-        var command = registry.get(cmdName);
-        @SuppressWarnings("unchecked")
-        List<Object> cmdArgs = (List<Object>) args;
-        Object result = command.execute(cmdArgs);
-        st.writeBuf = RespSerializer.serialize(result, st.writeBuf);
 
         st.readBuf.compact();
         key.interestOps(SelectionKey.OP_WRITE);

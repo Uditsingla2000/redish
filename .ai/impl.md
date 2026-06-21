@@ -888,4 +888,120 @@ register("EXPIRE", new ExpireCommand(store));
 | EXPIRE overwrite existing expiry | Replaces old expiry with new one |
 | EXPIRE non-integer seconds | Error: not an integer |
 
+---
+
+# Command pipelining — drain loop in handleRead
+
+## The problem
+
+`handleRead` processes exactly **one** command per readable event:
+
+```
+read() → flip() → parse() → execute() → serialize() → compact() → OP_WRITE
+```
+
+If the client sends 10 commands in one TCP segment, all 10 land in `readBuf`, but only 1 is executed. The remaining 9 sit in `readBuf` while the socket buffer is empty → OP_READ never fires again → those commands are orphaned.
+
+## The fix: drain loop in handleRead
+
+Turn the single-parse into a `while` loop that drains all complete commands from `readBuf` before switching to OP_WRITE:
+
+```
+read() → flip()
+         while (true):
+           save position
+           parse()
+           if null → restore position, break
+           if resp-exception → send error, disconnect, return
+           if not array → send error, break
+           execute → serialize into writeBuf
+           if count ≥ 5000 → break
+         compact()
+         OP_WRITE
+```
+
+## handleRead diff
+
+```java
+private void handleRead(SelectionKey key) throws IOException {
+    SocketChannel ch = (SocketChannel) key.channel();
+    ConnectionState st = (ConnectionState) key.attachment();
+
+    int n = ch.read(st.readBuf);
+    if (n == -1) { closeConnection(key); return; }
+
+    st.readBuf.flip();
+    int commands = 0;
+
+    while (commands++ < 5000) {
+        int start = st.readBuf.position();
+        Object parsed;
+
+        try {
+            parsed = RespParser.parse(st.readBuf);
+        } catch (RespException e) {
+            st.writeBuf = RespSerializer.serialize(
+                new ErrorResponse("ERR " + e.getMessage()), st.writeBuf);
+            st.readBuf.compact();
+            key.interestOps(SelectionKey.OP_WRITE);
+            return;  // disconnect after write — like Redis
+        }
+
+        if (parsed == null) {
+            st.readBuf.position(start);
+            break;  // partial frame, wait for more data
+        }
+
+        if (!(parsed instanceof List<?> args) || args.isEmpty()) {
+            st.writeBuf = RespSerializer.serialize(
+                new ErrorResponse("ERR expected array"), st.writeBuf);
+            break;  // can't recover framing
+        }
+
+        String cmdName = ((String) args.get(0)).toUpperCase();
+        Object result = registry.get(cmdName).execute((List<Object>) args);
+        st.writeBuf = RespSerializer.serialize(result, st.writeBuf);
+    }
+
+    st.readBuf.compact();
+    key.interestOps(SelectionKey.OP_WRITE);
+}
+```
+
+## Error behavior
+
+| Error | Where detected | Action |
+|---|---|---|
+| Protocol error (bad RESP) | `RespException` in parser | Send error, disconnect (like Redis `CLIENT_CLOSE_AFTER_REPLY`) |
+| Wrong command args | `Command.execute()` returns `ErrorResponse` | Per-command error in response array, pipeline continues |
+| Unknown command | `CommandRegistry` returns `UnknownCommand` | Per-command `-ERR unknown command`, pipeline continues |
+| Partial frame at end | `parse()` returns null | Rewind, break drain loop, compact, wait for more data |
+
+## Cap: 5000 commands per read event
+
+Counter stops the drain loop at 5000, preventing unbounded write-buffer growth. Remaining commands in `readBuf` wait for the next write→read cycle.
+
+## File changes
+
+| File | Change |
+|---|---|
+| `Server.java` | Replace single-parse with while-loop drain in `handleRead` |
+
+## Test plan (new file: `PipelineTest.java`)
+
+| Test | What it verifies |
+|---|---|
+| `twoCommands` | Send `SET k v` + `GET k` in one write, verify both responses |
+| `tenCommands` | 10 pipelined SETs + GETs |
+| `partialFrame` | One complete command + trailing partial, only first executes |
+| `commandErrorContinues` | Valid cmd + bad-args cmd + valid cmd → all three responses (second is error) |
+| `protocolErrorFails` | Malformed RESP → error response |
+
+## What does NOT change
+
+- `RespParser`, `RespSerializer`, `Store`, `Command`, `ConnectionState`, `CommandRegistry` — all untouched
+- The wire format for individual commands
+- The write path (`handleWrite` stays identical)
+- The accept path
+
 
