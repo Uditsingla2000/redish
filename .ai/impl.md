@@ -1004,4 +1004,366 @@ Counter stops the drain loop at 5000, preventing unbounded write-buffer growth. 
 - The write path (`handleWrite` stays identical)
 - The accept path
 
+---
+
+# AOF persistence — Append-Only File
+
+## Requirements (from user)
+
+| Decision | Choice |
+|---|---|
+| Enabled by default? | No — `--aof` flag to enable |
+| Fsync policy | Config file with Redis defaults (everysec), updateable naming |
+| AOF rewrite | Yes — include in this iteration |
+| Auto-recover on startup | Configurable via config file |
+| File path | `data/appendonly.aof` |
+| Configuration style | Startup flags only (no runtime CONFIG SET) |
+
+## What is AOF
+
+Every write command (`SET`, `DEL`, `EXPIRE`) is logged in RESP format to `data/appendonly.aof`. On restart, the file is replayed to reconstruct the dataset. This gives durability beyond the in-memory only store.
+
+## Redis defaults (used when config values are absent)
+
+| Config | Default |
+|---|---|
+| appendonly | no |
+| appendfsync | everysec |
+| auto-aof-rewrite-percentage | 100 |
+| auto-aof-rewrite-min-size | 64mb |
+| aof-load-truncated | yes |
+
+## Config file: `redish.conf`
+
+Java Properties format with comments. Loaded from working directory if present. Command-line flags override file values.
+
+```properties
+# AOF persistence
+# Enable AOF to log every write command to disk
+aof.enabled = false
+
+# Fsync policy: how often to synchronize the AOF file to disk
+#   always    — fsync after every write (slowest, safest)
+#   everysec  — fsync once per second (Redis default)
+#   no        — let OS handle it (fastest, least safe)
+aof.fsync = everysec
+
+# Recover state from AOF on server startup
+# If true and an AOF file exists, it is replayed before accepting connections
+aof.recover-on-startup = true
+
+# AOF rewrite triggers
+# Rewrite is triggered when the AOF file grows by this percentage
+# relative to the last rewrite size (100 = double the last size)
+aof.rewrite.percentage = 100
+
+# Minimum AOF file size (in bytes) before rewrite is considered
+# 67108864 = 64 MB
+aof.rewrite.min-size = 67108864
+```
+
+## Startup flags
+
+Flags override config file values:
+
+```
+--aof                        # enable AOF
+--aof-fsync <policy>         # override fsync policy
+--aof-no-recover             # disable auto-recovery
+--aof-dir <path>             # override AOF directory (default data/)
+```
+
+## AofWriter.java
+
+Writes RESP-formatted commands to the AOF file. Buffered writes with configurable fsync.
+
+```java
+package dev.redish.aof;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class AofWriter {
+
+    private final FileChannel channel;
+    private final ByteBuffer buf = ByteBuffer.allocateDirect(8192);
+    private final String fsyncPolicy;
+    private long lastFsync = System.currentTimeMillis();
+    private long fileSize;
+
+    public AofWriter(Path path, String fsyncPolicy) throws IOException { ... }
+    public void append(ByteBuffer command) throws IOException { ... }
+    public void flush() throws IOException { ... }
+    public void fsync() throws IOException { ... }
+    public long size() { return fileSize; }
+    public void close() throws IOException { ... }
+}
+```
+
+### `append(ByteBuffer command)`
+
+The command buffer is the raw RESP bytes received from the client (the parsed command before execution). Append bytes to internal buffer, flushing if full.
+
+### `flush()` / `fsync()`
+
+- `flush()` — write buffer to channel
+- `fsync()` — `channel.force(true)`, called per `fsyncPolicy`
+
+In the event loop, after every write-command execution, call `append()`. After the write buffer is drained (in `handleWrite`), check if a periodic fsync is needed:
+
+```
+if (aofEnabled && now - lastFsync >= 1000ms) { flush(); fsync(); }
+```
+
+## Determining write commands
+
+A command is a "write command" if it modifies state. The command implementations know this. Add a method to the `Command` interface:
+
+```java
+default boolean isWrite() { return false; }
+```
+
+Override in `SetCommand`, `DelCommand`, `ExpireCommand` to return `true`.
+
+In `Server.handleRead`, after executing a command:
+
+```java
+if (command.isWrite() && aofEnabled) {
+    // Re-serialize the args into RESP and append to AOF
+    ByteBuffer aofCmd = RespSerializer.serialize(args, ByteBuffer.allocate(64));
+    aofWriter.append(aofCmd);
+}
+```
+
+The raw client RESP is already in the read buffer but it's consumed by the parser. Instead, re-serialize `args` (the parsed command list) back into RESP wire format using `RespSerializer`.
+
+### Why re-serialize instead of saving raw bytes
+
+The raw bytes are consumed by the parser (position advanced). Saving them would require copying before parsing or using a look-behind buffer. Re-serializing the parsed args list is simpler and produces identical wire format.
+
+## AofRecovery.java
+
+On startup, if recovery is enabled and the AOF file exists:
+
+```java
+package dev.redish.aof;
+
+import dev.redish.command.CommandRegistry;
+import dev.redish.resp.RespParser;
+import dev.redish.store.Store;
+
+import java.io.FileInputStream;
+import java.io.InputStream;
+import java.util.List;
+
+public class AofRecovery {
+
+    public static void recover(Path aofPath, Store store, CommandRegistry registry) throws IOException {
+        try (InputStream in = new FileInputStream(aofPath.toFile())) {
+            while (true) {
+                Object parsed;
+                try {
+                    parsed = RespParser.parse(in);
+                } catch (Exception e) {
+                    break; // truncated or corrupt — stop recovery
+                }
+                if (parsed == null) break;
+                if (parsed instanceof List<?> args && !args.isEmpty()) {
+                    String cmdName = ((String) args.get(0)).toUpperCase();
+                    registry.get(cmdName).execute((List<Object>) args);
+                }
+            }
+        }
+    }
+}
+```
+
+Uses the existing `RespParser.parse(InputStream)` — the original blocking parser. The InputStream version already handles the protocol.
+
+## AofRewrite.java
+
+Rewrite compacts the AOF by scanning the current Store state and writing a minimal set of commands.
+
+```java
+package dev.redish.aof;
+
+import dev.redish.store.Store;
+import dev.redish.resp.RespSerializer;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+
+public class AofRewrite {
+
+    public static void rewrite(Store store, Path aofPath) throws IOException {
+        Path tmp = aofPath.resolveSibling(aofPath.getFileName() + ".tmp");
+        try (FileChannel ch = FileChannel.open(tmp,
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING)) {
+
+            ByteBuffer buf = ByteBuffer.allocate(8192);
+            for (var entry : store.allEntries()) {
+                // SET key value
+                List<Object> setCmd = List.of("SET", entry.key(), entry.data());
+                buf = RespSerializer.serialize(setCmd, buf);
+                buf.flip();
+                ch.write(buf);
+                buf.compact();
+            }
+            // TODO: handle expiry — write PEXPIRE or SET with EX for each expiring key
+        }
+        java.nio.file.Files.move(tmp, aofPath, StandardOpenOption.ATOMIC_MOVE);
+    }
+}
+```
+
+Requires `Store.allEntries()` to iterate over the key-value map, exposing non-expired entries and their expiry times.
+
+### Rewrite trigger
+
+Check after every write command:
+
+```java
+if (aofEnabled && aofWriter.size() > rewriteMinSize &&
+    aofWriter.size() > lastRewriteSize * (1 + rewritePercentage / 100.0)) {
+    AofRewrite.rewrite(store, aofPath);
+    lastRewriteSize = aofWriter.size();
+    // truncate and restart AOF
+    aofWriter.truncate(0);
+}
+```
+
+Since the server is single-threaded, the rewrite blocks the event loop. This is acceptable for a learning project — Redis forks a child process for this.
+
+## Changes to Store.java
+
+Add a method to iterate all entries:
+
+```java
+public record Entry(String key, byte[] data, long expiresAt) {}
+
+public List<Entry> allEntries() {
+    List<Entry> entries = new ArrayList<>();
+    for (var e : map.entrySet()) {
+        Value v = e.getValue();
+        if (!v.isExpired()) {
+            entries.add(new Entry(e.getKey(), (byte[]) v.data, v.expiresAt));
+        }
+    }
+    return entries;
+}
+```
+
+## Integration into Server.java
+
+In the `start()` method:
+
+```java
+// Load config
+Config config = Config.load("redish.conf", args);
+Store store = new Store();
+
+// AOF setup
+AofWriter aofWriter = null;
+long lastRewriteSize = 0;
+boolean aofEnabled = config.isAofEnabled();
+Path aofPath = config.getAofPath();
+
+if (aofEnabled) {
+    // Recover state from AOF if configured
+    if (config.isAofRecoverOnStartup() && Files.exists(aofPath)) {
+        AofRecovery.recover(aofPath, store, registry);
+    }
+    aofWriter = new AofWriter(aofPath, config.getAofFsync());
+}
+```
+
+In `handleRead`, after executing a write command:
+
+```java
+if (aofEnabled && command.isWrite()) {
+    ByteBuffer aofCmd = RespSerializer.serialize(cmdArgs, ByteBuffer.allocate(64));
+    aofWriter.append(aofCmd);
+    // Check rewrite trigger
+    checkAofRewrite();
+}
+```
+
+Add periodic fsync in the event loop (after each select cycle or in handleWrite):
+
+```java
+if (aofEnabled) {
+    aofWriter.flush(); // flushes buffer to OS
+    long now = System.currentTimeMillis();
+    if ("always".equals(aofFsync)) {
+        aofWriter.fsync();
+    } else if ("everysec".equals(aofFsync) && now - lastAofFsync >= 1000) {
+        aofWriter.fsync();
+        lastAofFsync = now;
+    }
+}
+```
+
+## AOF format
+
+Each command is logged as a RESP array of bulk strings, exactly as it would be sent by a client:
+
+```
+*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$5\r\nvalue\r\n
+*2\r\n$3\r\nDEL\r\n$4\r\nkey1\r\n
+*3\r\n$6\r\nEXPIRE\r\n$1\r\nk\r\n$2\r\n30\r\n
+```
+
+This is what RespSerializer produces from a `List<Object>`.
+
+## Edge cases
+
+| Case | Handling |
+|---|---|
+| AOF file missing on start | Skip recovery silently |
+| Corrupt AOF (truncated) | Stop replay at error, log warning (like Redis `aof-load-truncated`) |
+| AOF write failure | Log error, close connection (per Redis: stop accepting writes until fixed) |
+| Rewrite during active AOF | Write to `.tmp` file, atomically rename on success |
+| Key with expiry in rewrite | Write `SET key value PXAT <absolute-ms>` to preserve remaining TTL |
+| Fsync = always | Fsync after every write command (slow) |
+| Fsync = no | Never fsync, let OS flush when it wants |
+| Fsync = everysec | Fsync at most once per second |
+
+## File changes
+
+| File | Action |
+|---|---|
+| `redish.conf` | Create — config file with comments |
+| `src/main/java/dev/redish/Config.java` | Create — load config from file + CLI flags |
+| `src/main/java/dev/redish/aof/AofWriter.java` | Create — buffered AOF writer with fsync policy |
+| `src/main/java/dev/redish/aof/AofRecovery.java` | Create — replay AOF on startup |
+| `src/main/java/dev/redish/aof/AofRewrite.java` | Create — compact AOF via store scan |
+| `src/main/java/dev/redish/store/Store.java` | Add `allEntries()` and `Entry` record |
+| `src/main/java/dev/redish/command/Command.java` | Add `default boolean isWrite()` |
+| `src/main/java/dev/redish/command/SetCommand.java` | Override `isWrite()` → `true` |
+| `src/main/java/dev/redish/command/DelCommand.java` | Override `isWrite()` → `true` |
+| `src/main/java/dev/redish/command/ExpireCommand.java` | Override `isWrite()` → `true` |
+| `src/main/java/dev/redish/Server.java` | Integration: config load, AOF append, fsync, rewrite trigger |
+| `src/test/java/dev/redish/aof/AofWriterTest.java` | Create — write, flush, fsync, truncate |
+| `src/test/java/dev/redish/aof/AofRecoveryTest.java` | Create — write AOF, recover into fresh store |
+| `src/test/java/dev/redish/aof/AofRewriteTest.java` | Create — write AOF, rewrite, verify compact output |
+
+## Test strategy
+
+| Test | What it verifies |
+|---|---|
+| `AofWriter` writes RESP bytes to file | Read back bytes match expected RESP |
+| `AofWriter` respects fsync policy | File is on disk after fsync |
+| `AofRecovery` replays SET/DEL/EXPIRE | Store state matches after replay |
+| `AofRecovery` truncated file | Stops at corruption, recovers partial state |
+| `AofRewrite` compacts SETs | Multiple SETs of same key → single final value |
+| `AofRewrite` preserves expiring keys | Rewritten file still has correct TTL |
+| Integration: SET → restart → GET | Value survives restart |
+
+
 

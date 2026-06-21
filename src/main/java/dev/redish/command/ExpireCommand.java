@@ -23,4 +23,7 @@ public class ExpireCommand implements Command {
             return new ErrorResponse("ERR value is not an integer or out of range");
         }
     }
+
+    @Override
+    public boolean isWrite() { return true; }
 }

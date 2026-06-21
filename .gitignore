@@ -2,3 +2,6 @@ target/
 *.class
 tmp/
 logs/
+data/
+*.aof
+*.aof.tmp

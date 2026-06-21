@@ -1,9 +1,13 @@
 package dev.redish.store;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 public class Store {
+
+    public record Entry(String key, byte[] data, long expiresAt) {}
 
     private record Value(Object data, long expiresAt) {
         boolean isExpired() {
@@ -47,5 +51,16 @@ public class Store {
         if (v == null || v.isExpired()) return false;
         map.put(key, new Value(v.data, System.currentTimeMillis() + ttlMillis));
         return true;
+    }
+
+    public List<Entry> allEntries() {
+        List<Entry> entries = new ArrayList<>();
+        for (var e : map.entrySet()) {
+            Value v = e.getValue();
+            if (!v.isExpired()) {
+                entries.add(new Entry(e.getKey(), (byte[]) v.data, v.expiresAt));
+            }
+        }
+        return entries;
     }
 }

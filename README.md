@@ -20,6 +20,10 @@ mvn compile
 mvn exec:java -Dexec.mainClass=dev.redish.Server
 # or: ./rserver
 
+# Start server with AOF persistence
+mvn exec:java -Dexec.mainClass=dev.redish.Server -Dexec.args="--aof"
+# or: ./rserver --aof
+
 # Start interactive client (separate terminal)
 mvn exec:java -Dexec.mainClass=dev.redish.Client
 # or: ./rcli
@@ -37,37 +41,78 @@ mvn test
 
 ## Implemented Commands
 
-| Command | Behavior |
-|---|---|
-| `PING` | Returns `PONG` |
-| `PING <arg>` | Returns the argument as a bulk string |
-| `<anything else>` | Returns error: `ERR unknown command '...'` |
+| Command | Args | Behavior | Returns |
+|---|---|---|---|
+| `PING` | `[arg]` | Echo or return PONG | `+PONG` or bulk string |
+| `SET` | `key value [EX seconds]` | Store key with optional expiry | `+OK` |
+| `GET` | `key` | Retrieve value or nil | bulk string or `$-1` |
+| `TTL` | `key` | Seconds remaining or -1 if no expiry | `:<seconds>` or `:-1` |
+| `DEL` | `key [key ...]` | Delete keys, returns count | `:<count>` |
+| `EXPIRE` | `key seconds` | Set expiry in seconds | `:1` or `:0` |
+
+## Features
+
+- **Pipelining** — multiple commands in one write, processed in a single drain loop (cap 5000)
+- **Lazy expiry** — expired keys purged on access, no background thread
+- **AOF persistence** — Append-Only File logging (`--aof` flag), fsync policies (always/everysec/no), recovery on startup, rewrite compaction
 
 ## Project Structure
 
 ```
 src/
 ├── main/java/dev/redish/
-│   ├── Server.java              # TCP server, RESP dispatch loop
+│   ├── Server.java              # NIO Selector event loop
 │   ├── Client.java              # Interactive CLI, RESP over PushbackInputStream
+│   ├── ConnectionState.java     # Per-connection read/write buffers
+│   ├── Log.java                 # File logger to logs/YYYY-MM-DD.log
+│   ├── Logo.java                # ASCII art logo
+│   ├── Config.java              # Config file + CLI flag parser
 │   ├── command/
-│   │   ├── Command.java         # Command interface
+│   │   ├── Command.java         # Interface (isWrite())
 │   │   ├── CommandRegistry.java # Maps names → handlers
-│   │   ├── PingCommand.java     # PING handler
-│   │   └── UnknownCommand.java  # Fallback handler
+│   │   ├── PingCommand.java
+│   │   ├── SetCommand.java      # isWrite() = true
+│   │   ├── GetCommand.java
+│   │   ├── TtlCommand.java
+│   │   ├── DelCommand.java      # isWrite() = true
+│   │   ├── ExpireCommand.java   # isWrite() = true
+│   │   └── UnknownCommand.java  # Fallback
+│   ├── store/
+│   │   └── Store.java           # HashMap-backed key-value store with lazy expiry, allEntries()
+│   ├── aof/
+│   │   ├── AofWriter.java       # Buffered FileChannel writer
+│   │   ├── AofRecovery.java     # Replay AOF on startup
+│   │   └── AofRewrite.java      # Compact rewrite
 │   └── resp/
-│       ├── RespType.java        # RESP type identifiers
-│       ├── RespParser.java      # InputStream → Java objects
-│       ├── RespSerializer.java  # Java objects → RESP wire format
-│       └── ErrorResponse.java   # Error record (auto-serialized)
+│       ├── RespType.java
+│       ├── RespParser.java      # InputStream + ByteBuffer parsers
+│       ├── RespSerializer.java  # OutputStream + ByteBuffer serializers
+│       ├── ErrorResponse.java
+│       └── RespException.java
 └── test/java/dev/redish/
-    ├── RespParserTest.java      # RESP parsing tests
-    ├── RespSerializerTest.java  # RESP serialization tests
-    ├── PingCommandTest.java     # PING command tests
-    └── CommandRegistryTest.java # Registry tests
+    ├── PipelineTest.java        # Pipelining tests (11)
+    ├── aof/
+    │   ├── AofWriterTest.java   # AOF writer tests (4)
+    │   ├── AofRecoveryTest.java # AOF recovery tests (4)
+    │   └── AofRewriteTest.java  # AOF rewrite tests (4)
+    ├── command/
+    │   ├── PingCommandTest.java
+    │   ├── SetCommandTest.java
+    │   ├── GetCommandTest.java
+    │   ├── TtlCommandTest.java
+    │   ├── DelCommandTest.java
+    │   ├── ExpireCommandTest.java
+    │   └── CommandRegistryTest.java
+    ├── store/
+    │   └── StoreTest.java
+    └── resp/
+        ├── RespParserTest.java
+        ├── RespSerializerTest.java
+        └── RespByteBufferTest.java
 ```
 
 ## Status
 
-Working: RESP protocol, Command pattern, PING, error handling, tests.
-Next: Add SET/GET with in-memory store, concurrent clients.
+Working: RESP protocol, Command pattern, PING, SET, GET, TTL, DEL, EXPIRE, pipelining, in-memory store with lazy expiry, NIO event loop, file logging, AOF persistence (write, recovery, rewrite, fsync policies).
+
+**122 tests** — all passing (`mvn test`).

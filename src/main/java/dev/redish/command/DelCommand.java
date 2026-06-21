@@ -22,4 +22,7 @@ public class DelCommand implements Command {
         }
         return count;
     }
+
+    @Override
+    public boolean isWrite() { return true; }
 }
