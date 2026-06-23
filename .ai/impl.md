@@ -1365,5 +1365,203 @@ This is what RespSerializer produces from a `List<Object>`.
 | `AofRewrite` preserves expiring keys | Rewritten file still has correct TTL |
 | Integration: SET → restart → GET | Value survives restart |
 
+---
 
+# Key eviction — maxkeys memory management
+
+## Requirements
+
+- Configurable `maxkeys` in `redish.conf` (default 0 = unlimited)
+- Configurable `eviction-policy` in `redish.conf` (default `noeviction`)
+- Strategy pattern — each policy selects a victim differently
+- `evictIfNeeded()` called in Server before executing write commands
+
+## Phase 1: two policies
+
+| Policy | Behavior |
+|---|---|
+| `noeviction` | Return error on write when over maxkeys |
+| `allkeys-random` | Evict a random key |
+
+## Config additions (`redish.conf`)
+
+```properties
+# Maximum number of keys before eviction is triggered (0 = no limit)
+maxkeys = 0
+
+# Eviction policy when maxkeys is reached
+#   noeviction       — return error on write commands (default)
+#   allkeys-random   — evict a random key
+eviction-policy = noeviction
+```
+
+CLI flags:
+```
+--maxkeys <n>               # override maxkeys
+--eviction-policy <policy>  # override eviction policy
+```
+
+## `EvictionPolicy.java`
+
+Enum with `selectVictim(keySet)` method. Keeps the selection logic isolated from Store.
+
+```java
+package dev.redish.store;
+
+import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+
+public enum EvictionPolicy {
+    NOEVICTION,
+    ALLKEYS_RANDOM;
+
+    public static EvictionPolicy fromString(String s) {
+        return switch (s.toLowerCase()) {
+            case "allkeys-random" -> ALLKEYS_RANDOM;
+            default -> NOEVICTION;
+        };
+    }
+
+    public String configName() {
+        return switch (this) {
+            case NOEVICTION -> "noeviction";
+            case ALLKEYS_RANDOM -> "allkeys-random";
+        };
+    }
+
+    /** Select a key to evict, or null if no candidate exists. */
+    public String selectVictim(Set<String> keys) {
+        return switch (this) {
+            case NOEVICTION -> null;
+            case ALLKEYS_RANDOM -> {
+                if (keys.isEmpty()) yield null;
+                int idx = ThreadLocalRandom.current().nextInt(keys.size());
+                int i = 0;
+                for (String k : keys) { if (i++ == idx) yield k; }
+                yield null;
+            }
+        };
+    }
+}
+```
+
+## Store changes
+
+### New methods
+
+```java
+private int maxKeys;
+private EvictionPolicy policy;
+
+public void setMaxKeys(int maxKeys) { this.maxKeys = maxKeys; }
+public int getMaxKeys() { return maxKeys; }
+public void setEvictionPolicy(EvictionPolicy policy) { this.policy = policy; }
+public EvictionPolicy getEvictionPolicy() { return policy; }
+
+public int size() { return map.size(); }
+
+/** Returns error message if command should be rejected, null if OK to proceed. */
+public String evictIfNeeded() {
+    if (maxKeys <= 0 || map.size() < maxKeys) return null;
+    if (policy == EvictionPolicy.NOEVICTION) {
+        return "ERR command not allowed when used memory > 'maxkeys'";
+    }
+    String victim = policy.selectVictim(map.keySet());
+    if (victim != null) map.remove(victim);
+    return null;
+}
+```
+
+## Server integration
+
+In `Server.java`, config setup:
+
+```java
+if (config.getMaxKeys() > 0) {
+    store.setMaxKeys(config.getMaxKeys());
+    store.setEvictionPolicy(config.getEvictionPolicy());
+    Log.info("Eviction: maxkeys=" + config.getMaxKeys()
+        + " policy=" + config.getEvictionPolicy().configName());
+}
+```
+
+In `handleRead`, before executing a write command:
+
+```java
+if (cmd.isWrite()) {
+    String evictErr = store.evictIfNeeded();
+    if (evictErr != null) {
+        result = new ErrorResponse(evictErr);
+    } else {
+        result = cmd.execute(cmdArgs);
+        appendAof(cmdArgs);
+    }
+} else {
+    result = cmd.execute(cmdArgs);
+}
+```
+
+## `Config.java` additions
+
+```java
+public int getMaxKeys() {
+    String val = props.getProperty("maxkeys", "0");
+    try { return Integer.parseInt(val); } catch (NumberFormatException e) { return 0; }
+}
+
+public EvictionPolicy getEvictionPolicy() {
+    return EvictionPolicy.fromString(props.getProperty("eviction-policy", "noeviction"));
+}
+```
+
+CLI flag parsing:
+
+```java
+case "--maxkeys" -> {
+    if (i + 1 < args.length) props.setProperty("maxkeys", args[++i]);
+}
+case "--eviction-policy" -> {
+    if (i + 1 < args.length) props.setProperty("eviction-policy", args[++i]);
+}
+```
+
+## Edge cases
+
+| Case | Handling |
+|---|---|
+| maxkeys = 0 (default) | No eviction, no checks |
+| noeviction + write command | Error returned to client |
+| noeviction + read-only commands | Read commands pass through normally |
+| noeviction + DEL/EXPIRE | DEL removes data, EXPIRE modifies expiry — both proceed |
+| allkeys-random with empty store | selectVictim returns null, write proceeds |
+| --maxkeys 0 + --eviction-policy allkeys-random | No limit, policy is ignored |
+
+## Test plan (new file: `EvictionTest.java`)
+
+| Test | What it verifies |
+|---|---|
+| under maxkeys | set/get work normally |
+| noeviction blocks writes | Error response when over limit |
+| allkeys-random evicts something | Key count decreases by 1 |
+| maxkeys=0 | No eviction regardless of count |
+
+## File changes
+
+| File | Action |
+|---|---|
+| `redish.conf` | Add `maxkeys`, `eviction-policy` with comments |
+| `src/main/java/dev/redish/store/EvictionPolicy.java` | Create — enum with NOEVICTION and ALLKEYS_RANDOM |
+| `src/main/java/dev/redish/store/Store.java` | Add `maxKeys`/`policy` fields, `size()`, `evictIfNeeded()` |
+| `src/main/java/dev/redish/Config.java` | Add `getMaxKeys()`, `getEvictionPolicy()`, `--maxkeys`/`--eviction-policy` flags |
+| `src/main/java/dev/redish/Server.java` | Configure Store eviction on startup, call `evictIfNeeded()` before write commands |
+| `src/test/java/dev/redish/store/EvictionTest.java` | Create |
+
+## Implementation order
+
+1. **EvictionPolicy.java** — enum with `selectVictim()`
+2. **Store.java** — add `maxKeys`, `policy`, `evictIfNeeded()`, `size()`
+3. **Config.java** — add config properties + CLI flags
+4. **Server.java** — configure store, integrate eviction check in handleRead
+5. **redish.conf** — add config section
+6. **EvictionTest.java** — test scenarios
 

@@ -7,25 +7,72 @@ import java.util.Map;
 
 public class Store {
 
-    public record Entry(String key, byte[] data, long expiresAt) {}
+    public record Entry(String key, byte[] data, long expiresAt) {
+        static Entry fromMapEntry(String key, RedisObject obj, long expiresAt) {
+            return new Entry(key, obj.stringBytes(), expiresAt);
+        }
+    }
 
-    private record Value(Object data, long expiresAt) {
+    private record Value(RedisObject data, long expiresAt) {
         boolean isExpired() {
             return expiresAt != -1 && System.currentTimeMillis() > expiresAt;
         }
     }
 
     private final Map<String, Value> map = new HashMap<>();
+    private int maxKeys;
+    private EvictionPolicy policy = EvictionPolicy.NOEVICTION;
 
-    public void set(String key, Object value) {
-        map.put(key, new Value(value, -1));
+    public void setMaxKeys(int maxKeys) { this.maxKeys = maxKeys; }
+    public int getMaxKeys() { return maxKeys; }
+    public void setEvictionPolicy(EvictionPolicy policy) { this.policy = policy; }
+    public EvictionPolicy getEvictionPolicy() { return policy; }
+
+    public int size() { return map.size(); }
+
+    public String evictIfNeeded() {
+        if (maxKeys <= 0 || map.size() < maxKeys) return null;
+        if (policy == EvictionPolicy.NOEVICTION) {
+            return "ERR command not allowed when used memory > 'maxkeys'";
+        }
+        String victim = policy.selectVictim(map.keySet());
+        if (victim != null) map.remove(victim);
+        return null;
     }
 
-    public void setex(String key, Object value, long ttlMillis) {
-        map.put(key, new Value(value, System.currentTimeMillis() + ttlMillis));
+    public void set(String key, byte[] value) {
+        map.put(key, new Value(RedisObject.string(value), -1));
     }
 
-    public Object get(String key) {
+    public void setex(String key, byte[] value, long ttlMillis) {
+        map.put(key, new Value(RedisObject.string(value), System.currentTimeMillis() + ttlMillis));
+    }
+
+    public RedisObject set(String key, RedisObject obj) {
+        map.put(key, new Value(obj, -1));
+        return obj;
+    }
+
+    public RedisObject setex(String key, RedisObject obj, long ttlMillis) {
+        map.put(key, new Value(obj, System.currentTimeMillis() + ttlMillis));
+        return obj;
+    }
+
+    public byte[] get(String key) {
+        Value v = map.get(key);
+        if (v == null) return null;
+        if (v.isExpired()) { map.remove(key); return null; }
+        if (v.data.type() != RedisType.STRING) return null;
+        return v.data.stringBytes();
+    }
+
+    public RedisType getType(String key) {
+        Value v = map.get(key);
+        if (v == null || v.isExpired()) { return null; }
+        return v.data.type();
+    }
+
+    public RedisObject getObject(String key) {
         Value v = map.get(key);
         if (v == null) return null;
         if (v.isExpired()) { map.remove(key); return null; }
@@ -58,7 +105,7 @@ public class Store {
         for (var e : map.entrySet()) {
             Value v = e.getValue();
             if (!v.isExpired()) {
-                entries.add(new Entry(e.getKey(), (byte[]) v.data, v.expiresAt));
+                entries.add(Entry.fromMapEntry(e.getKey(), v.data, v.expiresAt));
             }
         }
         return entries;

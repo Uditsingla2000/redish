@@ -47,6 +47,13 @@ public class Server {
         } else {
             this.aofWriter = null;
         }
+
+        if (config.getMaxKeys() > 0) {
+            store.setMaxKeys(config.getMaxKeys());
+            store.setEvictionPolicy(config.getEvictionPolicy());
+            Log.info("Eviction: maxkeys=" + config.getMaxKeys()
+                + " policy=" + config.getEvictionPolicy().configName());
+        }
     }
 
     public void start() throws IOException {
@@ -188,8 +195,18 @@ public class Server {
             Command cmd = registry.get(cmdName);
             @SuppressWarnings("unchecked")
             List<Object> cmdArgs = (List<Object>) args;
-            Object result = cmd.execute(cmdArgs);
-            if (cmd.isWrite()) appendAof(cmdArgs);
+            Object result;
+            if (cmd.isWrite()) {
+                String evictErr = store.evictIfNeeded();
+                if (evictErr != null) {
+                    result = new ErrorResponse(evictErr);
+                } else {
+                    result = cmd.execute(cmdArgs);
+                    appendAof(cmdArgs);
+                }
+            } else {
+                result = cmd.execute(cmdArgs);
+            }
             st.writeBuf = RespSerializer.serialize(result, st.writeBuf);
         }
 

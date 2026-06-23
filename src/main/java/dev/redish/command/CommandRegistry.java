@@ -16,6 +16,8 @@ public class CommandRegistry {
         register("TTL",    new TtlCommand(store));
         register("DEL",    new DelCommand(store));
         register("EXPIRE", new ExpireCommand(store));
+        register("INCR",   new IncrCommand(store));
+        register("TYPE",   new TypeCommand(store));
     }
 
     public void register(String name, Command command) {

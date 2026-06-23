@@ -1,5 +1,7 @@
 package dev.redish;
 
+import dev.redish.store.EvictionPolicy;
+
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -32,6 +34,12 @@ public class Config {
                 case "--aof-dir" -> {
                     if (i + 1 < args.length) props.setProperty("aof.dir", args[++i]);
                 }
+                case "--maxkeys" -> {
+                    if (i + 1 < args.length) props.setProperty("maxkeys", args[++i]);
+                }
+                case "--eviction-policy" -> {
+                    if (i + 1 < args.length) props.setProperty("eviction-policy", args[++i]);
+                }
             }
         }
     }
@@ -61,5 +69,14 @@ public class Config {
     public long getRewriteMinSize() {
         String val = props.getProperty("aof.rewrite.min-size", "67108864");
         return Long.parseLong(val);
+    }
+
+    public int getMaxKeys() {
+        String val = props.getProperty("maxkeys", "0");
+        try { return Integer.parseInt(val); } catch (NumberFormatException e) { return 0; }
+    }
+
+    public EvictionPolicy getEvictionPolicy() {
+        return EvictionPolicy.fromString(props.getProperty("eviction-policy", "noeviction"));
     }
 }
